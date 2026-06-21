@@ -300,7 +300,7 @@ void rendererInit(JNIEnv* env) {
         return;
 
     (*env)->GetJavaVM(env, &vm);
-    jclass clazz = (*env)->FindClass(env, "dev/debiondex/x11/LorieView");
+    jclass clazz = (*env)->FindClass(env, "io/breadstick/x11/LorieView");
     lorieViewClass = (*env)->NewGlobalRef(env, clazz);
     setRendererViewportMethod = (*env)->GetStaticMethodID(env, lorieViewClass, "setRendererViewport", "(IIIIFFFF)V");
 

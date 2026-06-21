@@ -6,7 +6,7 @@ by the BSL app. Produces `libXlorie.so` (arm64), vendored into `../Android/app/s
 BSL-specific work lives in `build/termux-x11/app/src/main/cpp/lorie/` — notably the **rootless
 per-window pipeline** (Composite-redirect each top-level window → its own AHardwareBuffer →
 handed to the host so each guest window is its own DeX window) and the resize/keyboard/clipboard
-integration. JNI is rebranded to `dev.debiondex.x11` (kept stable; do not rename — it binds the
+integration. JNI is rebranded to `io.breadstick.x11` (kept stable; do not rename — it binds the
 native symbols).
 
 Build: CMake + Ninja with the x86_64 NDK r28c clang under `qemu-user-static` on an arm64 host:

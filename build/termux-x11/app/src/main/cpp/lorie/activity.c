@@ -24,13 +24,13 @@
 #pragma ide diagnostic ignored "ConstantFunctionResult"
 #define log(prio, ...) __android_log_print(ANDROID_LOG_ ## prio, "LorieNative", __VA_ARGS__)
 
-// DebiOnDeX runs the X server AND the renderer in ONE process (upstream uses two), so the
+// Breadstick runs the X server AND the renderer in ONE process (upstream uses two), so the
 // renderer must NOT share the server's conn_fd: sharing makes connect_ overwrite it and
 // close the server's socket end, breaking the resize/event channel. Give the renderer its
 // own private fd — its end of the getXConnection socketpair.
 static volatile int conn_fd = -1;
 
-// DebiOnDeX rootless: remember received buffers by id (read-loop thread only — no lock
+// Breadstick rootless: remember received buffers by id (read-loop thread only — no lock
 // needed) so a window-state event can hand the matching AHardwareBuffer to Java.
 #define LORIE_MAX_WIN_BUFFERS 256
 static struct { uint64_t id; AHardwareBuffer* ahb; } lorieWinBufs[LORIE_MAX_WIN_BUFFERS];
@@ -149,8 +149,8 @@ static void nativeInit(JNIEnv *env, jobject thiz) {
         CharBuffer.self = FindClassOrDie(env,  "java/nio/CharBuffer");
         CharBuffer.toString = FindMethodOrDie(env, CharBuffer.self, "toString", "()Ljava/lang/String;", JNI_FALSE);
 
-        MainActivity.self = FindClassOrDie(env,  "dev/debiondex/x11/MainActivity");
-        MainActivity.getInstance = FindMethodOrDie(env, MainActivity.self, "getInstance", "()Ldev/debiondex/x11/MainActivity;", JNI_TRUE);
+        MainActivity.self = FindClassOrDie(env,  "io/breadstick/x11/MainActivity");
+        MainActivity.getInstance = FindMethodOrDie(env, MainActivity.self, "getInstance", "()Lio/breadstick/x11/MainActivity;", JNI_TRUE);
         MainActivity.clientConnectedStateChanged = FindMethodOrDie(env, MainActivity.self, "clientConnectedStateChanged", "()V", JNI_FALSE);
         MainActivity.resetIme = FindMethodOrDie(env, (*env)->GetObjectClass(env, thiz), "resetIme", "()V", JNI_FALSE);
     }
@@ -461,7 +461,7 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, __unused void *reserved) {
             {"requestConnection", "()Z", (void *)&requestConnection},
     };
     (*vm)->AttachCurrentThread(vm, &env, NULL);
-    jclass cls = (*env)->FindClass(env, "dev/debiondex/x11/LorieView");
+    jclass cls = (*env)->FindClass(env, "io/breadstick/x11/LorieView");
     (*env)->RegisterNatives(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
 
     return JNI_VERSION_1_6;
@@ -498,7 +498,7 @@ extern char* __progname;
 __attribute__((constructor)) static void init(void) {
     pthread_t t;
     // Tee the X server's stdout/stderr to logcat and (when set) to XLORIE_LOG_FILE, which
-    // survives a crash so DebiOnDeX can show why the server died.
-    if (!strcmp(__progname, "dev.debiondex") || getenv("XLORIE_LOG_FILE"))
+    // survives a crash so Breadstick can show why the server died.
+    if (!strcmp(__progname, "io.breadstick") || getenv("XLORIE_LOG_FILE"))
         pthread_create(&t, NULL, stderrToLogcatThread, NULL);
 }

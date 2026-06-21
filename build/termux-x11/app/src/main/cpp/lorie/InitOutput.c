@@ -504,7 +504,7 @@ void lorieSetWindowPixmap(WindowPtr pWindow, PixmapPtr newPixmap) {
     pvfb->SetWindowPixmap = pScreenPtr->SetWindowPixmap;
     pScreenPtr->SetWindowPixmap = lorieSetWindowPixmap;
 
-    // DebiOnDeX rootless: a top-level window's backing pixmap just changed — typically because
+    // Breadstick rootless: a top-level window's backing pixmap just changed — typically because
     // it was resized (Composite reallocated it). Re-export the new buffer + geometry so the
     // host (Android) window redraws at the new size instead of stretching a stale buffer.
     if (!isRoot && lorieRootlessEnabled() && pWindow->realized && lorieIsTopLevel(pWindow))
@@ -638,10 +638,10 @@ void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d) {
     }
 }
 
-// --- DebiOnDeX rootless: track top-level windows + export each one's pixmap to Android. ---
+// --- Breadstick rootless: track top-level windows + export each one's pixmap to Android. ---
 extern ClientPtr serverClient;
 extern int compRedirectSubwindows(ClientPtr pClient, WindowPtr pWin, int update);
-#define DEBIONDEX_REDIRECT_MANUAL 1   // CompositeRedirectManual
+#define BREADSTICK_REDIRECT_MANUAL 1   // CompositeRedirectManual
 
 static Bool (*lorieRealizeWindow)(WindowPtr);
 static Bool (*lorieUnrealizeWindow)(WindowPtr);
@@ -650,7 +650,7 @@ static Bool (*loriePositionWindow)(WindowPtr, int, int);
 
 static int lorieRootlessEnabled(void) {
     static int v = -1;
-    if (v == -1) v = getenv("DEBIONDEX_ROOTLESS") ? 1 : 0;
+    if (v == -1) v = getenv("BREADSTICK_ROOTLESS") ? 1 : 0;
     return v;
 }
 
@@ -665,7 +665,7 @@ static void lorieEnsureRedirect(ScreenPtr s) {
     if (done || !s || !s->root)
         return;
     done = 1;
-    compRedirectSubwindows(serverClient, s->root, DEBIONDEX_REDIRECT_MANUAL);
+    compRedirectSubwindows(serverClient, s->root, BREADSTICK_REDIRECT_MANUAL);
 }
 
 // Make sure the window's backing pixmap is AHardwareBuffer-backed (shippable), register it,

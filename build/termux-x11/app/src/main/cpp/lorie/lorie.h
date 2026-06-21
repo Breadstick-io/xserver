@@ -107,7 +107,7 @@ typedef enum {
     EVENT_CLIPBOARD_REQUEST,
     EVENT_CLIPBOARD_SEND,
     EVENT_WINDOW_FOCUS_CHANGED,
-    EVENT_WINDOW_STATE, // DebiOnDeX rootless: top-level window geometry / mapped state
+    EVENT_WINDOW_STATE, // Breadstick rootless: top-level window geometry / mapped state
 } eventType;
 
 typedef union {

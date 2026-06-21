@@ -70,7 +70,7 @@ static Bool detectTracer(void)
 }
 
 JNIEXPORT jboolean JNICALL
-Java_dev_debiondex_x11_CmdEntryPoint_start(JNIEnv *env, __unused jclass cls, jobjectArray args) {
+Java_io_breadstick_x11_CmdEntryPoint_start(JNIEnv *env, __unused jclass cls, jobjectArray args) {
     pthread_t t;
     JavaVM* vm = NULL;
     // execv's argv array is a bit incompatible with Java's String[], so we do some converting here...
@@ -425,7 +425,7 @@ void lorieRequestClipboard(void) {
     }
 }
 
-// DebiOnDeX rootless: tell the activity about a top-level window's geometry / mapped state.
+// Breadstick rootless: tell the activity about a top-level window's geometry / mapped state.
 void lorieSendWindowState(uint32_t window, int16_t x, int16_t y, uint16_t width, uint16_t height, uint8_t mapped, uint64_t buffer) {
     if (conn_fd != -1) {
         lorieEvent e = { .windowState = { .t = EVENT_WINDOW_STATE, .window = window,
@@ -493,7 +493,7 @@ void DDXNotifyFocusChanged(void) {
 }
 
 JNIEXPORT jobject JNICALL
-Java_dev_debiondex_x11_CmdEntryPoint_getXConnection(JNIEnv *env, __unused jobject cls) {
+Java_io_breadstick_x11_CmdEntryPoint_getXConnection(JNIEnv *env, __unused jobject cls) {
     int client[2];
     jclass ParcelFileDescriptorClass = (*env)->FindClass(env, "android/os/ParcelFileDescriptor");
     jmethodID adoptFd = (*env)->GetStaticMethodID(env, ParcelFileDescriptorClass, "adoptFd", "(I)Landroid/os/ParcelFileDescriptor;");
@@ -514,7 +514,7 @@ void* logcatThread(void *arg) {
 }
 
 JNIEXPORT jobject JNICALL
-Java_dev_debiondex_x11_CmdEntryPoint_getLogcatOutput(JNIEnv *env, __unused jobject cls) {
+Java_io_breadstick_x11_CmdEntryPoint_getLogcatOutput(JNIEnv *env, __unused jobject cls) {
     jclass ParcelFileDescriptorClass = (*env)->FindClass(env, "android/os/ParcelFileDescriptor");
     jmethodID adoptFd = (*env)->GetStaticMethodID(env, ParcelFileDescriptorClass, "adoptFd", "(I)Landroid/os/ParcelFileDescriptor;");
     const char *debug = getenv("TERMUX_X11_DEBUG");
@@ -530,12 +530,12 @@ Java_dev_debiondex_x11_CmdEntryPoint_getLogcatOutput(JNIEnv *env, __unused jobje
 }
 
 JNIEXPORT jboolean JNICALL
-Java_dev_debiondex_x11_CmdEntryPoint_connected(__unused JNIEnv *env, __unused jclass clazz) {
+Java_io_breadstick_x11_CmdEntryPoint_connected(__unused JNIEnv *env, __unused jclass clazz) {
     return conn_fd != -1;
 }
 
 JNIEXPORT void JNICALL
-Java_dev_debiondex_x11_CmdEntryPoint_listenForConnections(JNIEnv *env, jobject thiz) {
+Java_io_breadstick_x11_CmdEntryPoint_listenForConnections(JNIEnv *env, jobject thiz) {
     int server_fd, client, count;
     struct sockaddr_in address = { .sin_family = AF_INET, .sin_addr = { .s_addr = INADDR_ANY }, .sin_port = htons(PORT) };
     int addrlen = sizeof(address);
