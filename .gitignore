@@ -1,0 +1,7 @@
+# build outputs (sources live under build/termux-x11 — do NOT ignore "build/")
+**/app/build/
+**/.cxx/
+**/.gradle/
+**/.kotlin/
+*.apk
+*.aab
