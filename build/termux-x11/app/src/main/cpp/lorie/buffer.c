@@ -302,6 +302,17 @@ __LIBC_HIDDEN__ int LorieBuffer_lock(LorieBuffer* buffer, void** out) {
     else if (buffer->desc.type == LORIEBUFFER_AHARDWAREBUFFER)
         ret = AHardwareBuffer_lock(buffer->desc.buffer, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, NULL, &buffer->lockedData);
 
+    if (ret) {
+        // Marking the buffer locked after a failed AHardwareBuffer_lock wedges it permanently:
+        // every retry returns EEXIST with a NULL data pointer and drawing silently stops.
+        // Leave it unlocked so the next loriePrepareAccess can retry (and report the error).
+        dprintf(2, "failed to lock buffer, err %d\n", ret);
+        buffer->lockedData = NULL;
+        if (out)
+            *out = NULL;
+        return ret;
+    }
+
     if (out)
         *out = buffer->lockedData;
 
