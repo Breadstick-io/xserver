@@ -43,6 +43,8 @@ static void lorieRememberBuffer(uint64_t id, AHardwareBuffer* ahb) {
         if (slot < 0 && lorieWinBufs[i].ahb == NULL) slot = i;
     }
     if (slot >= 0) { lorieWinBufs[slot].id = id; lorieWinBufs[slot].ahb = ahb; }
+    else log(ERROR, "lorieWinBufs full (%d entries) — dropping buffer %llu; its window will not render",
+             LORIE_MAX_WIN_BUFFERS, (unsigned long long) id);
 }
 
 static void lorieForgetBuffer(uint64_t id) {
