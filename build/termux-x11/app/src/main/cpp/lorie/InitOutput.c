@@ -702,7 +702,8 @@ static void lorieReportWindow(WindowPtr pWin, uint8_t mapped) {
         return;
     uint64_t buffer = mapped ? lorieWindowBufferId(pWin) : 0;
     lorieSendWindowState((uint32_t) pWin->drawable.id, pWin->drawable.x, pWin->drawable.y,
-                         pWin->drawable.width, pWin->drawable.height, mapped, buffer);
+                         pWin->drawable.width, pWin->drawable.height, mapped,
+                         pWin->overrideRedirect ? 1 : 0, buffer);
 }
 
 static Bool lorieRealizeWindowWrap(WindowPtr pWin) {

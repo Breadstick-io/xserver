@@ -250,11 +250,12 @@ static int xcallback(int fd, int events, __unused void* data) {
                 }
                 case EVENT_WINDOW_STATE: {
                     // Geometry / mapped state — drives the live window list.
-                    jmethodID ms = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, thiz), "onWindowState", "(IIIIIZ)V");
+                    jmethodID ms = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, thiz), "onWindowState", "(IIIIIZZ)V");
                     if (ms)
                         (*env)->CallVoidMethod(env, thiz, ms, (jint) e.windowState.window, (jint) e.windowState.x,
                                                (jint) e.windowState.y, (jint) e.windowState.width,
-                                               (jint) e.windowState.height, (jboolean) e.windowState.mapped);
+                                               (jint) e.windowState.height, (jboolean) e.windowState.mapped,
+                                               (jboolean) e.windowState.popup);
                     // Pixels — hand the window's AHardwareBuffer to Java as a HardwareBuffer.
                     if (e.windowState.mapped && e.windowState.buffer) {
                         AHardwareBuffer* ahb = lorieFindBuffer(e.windowState.buffer);
