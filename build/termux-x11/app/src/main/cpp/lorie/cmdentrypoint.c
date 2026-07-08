@@ -426,10 +426,12 @@ void lorieRequestClipboard(void) {
 }
 
 // Breadstick rootless: tell the activity about a top-level window's geometry / mapped state.
-void lorieSendWindowState(uint32_t window, int16_t x, int16_t y, uint16_t width, uint16_t height, uint8_t mapped, uint8_t popup, uint64_t buffer) {
+void lorieSendWindowState(uint32_t window, int16_t x, int16_t y, uint16_t width, uint16_t height, uint8_t mapped, uint8_t popup, uint64_t buffer, const char *title) {
     if (conn_fd != -1) {
         lorieEvent e = { .windowState = { .t = EVENT_WINDOW_STATE, .window = window,
                                           .x = x, .y = y, .width = width, .height = height, .mapped = mapped, .popup = popup, .buffer = buffer } };
+        if (title)
+            strncpy(e.windowState.title, title, sizeof(e.windowState.title) - 1);
         write(conn_fd, &e, sizeof(e));
     }
 }

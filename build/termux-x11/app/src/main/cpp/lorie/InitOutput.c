@@ -37,6 +37,8 @@
 #include "exa.h"
 #include "drm_fourcc.h"
 
+#include <X11/Xatom.h>
+#include "propertyst.h"
 #include "lorie.h"
 
 #define DRM_FORMAT_MOD_LINEAR 0
@@ -697,13 +699,37 @@ static uint64_t lorieWindowBufferId(WindowPtr pWin) {
     return desc->id;
 }
 
+// The window's user-visible title: _NET_WM_NAME (UTF-8) preferred, WM_NAME as fallback.
+static void lorieWindowTitle(WindowPtr pWin, char *out, size_t cap) {
+    static Atom netWmName, utf8String;
+    PropertyPtr prop;
+    out[0] = 0;
+    if (!netWmName) {
+        netWmName = MakeAtom("_NET_WM_NAME", 12, TRUE);
+        utf8String = MakeAtom("UTF8_STRING", 11, TRUE);
+    }
+    if (dixLookupProperty(&prop, pWin, netWmName, serverClient, DixReadAccess) == Success
+            && prop && prop->type == utf8String && prop->format == 8 && prop->size) {
+        size_t n = prop->size < cap - 1 ? prop->size : cap - 1;
+        memcpy(out, prop->data, n); out[n] = 0;
+        return;
+    }
+    if (dixLookupProperty(&prop, pWin, XA_WM_NAME, serverClient, DixReadAccess) == Success
+            && prop && prop->format == 8 && prop->size) {
+        size_t n = prop->size < cap - 1 ? prop->size : cap - 1;
+        memcpy(out, prop->data, n); out[n] = 0;
+    }
+}
+
 static void lorieReportWindow(WindowPtr pWin, uint8_t mapped) {
+    char title[96];
     if (!lorieIsTopLevel(pWin))
         return;
     uint64_t buffer = mapped ? lorieWindowBufferId(pWin) : 0;
+    lorieWindowTitle(pWin, title, sizeof(title));
     lorieSendWindowState((uint32_t) pWin->drawable.id, pWin->drawable.x, pWin->drawable.y,
                          pWin->drawable.width, pWin->drawable.height, mapped,
-                         pWin->overrideRedirect ? 1 : 0, buffer);
+                         pWin->overrideRedirect ? 1 : 0, buffer, title);
 }
 
 static Bool lorieRealizeWindowWrap(WindowPtr pWin) {

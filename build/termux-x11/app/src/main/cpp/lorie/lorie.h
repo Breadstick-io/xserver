@@ -34,7 +34,7 @@ void lorieActivityConnected(void);
 void lorieSendSharedServerState(int memfd);
 void lorieRegisterBuffer(LorieBuffer* buffer);
 void lorieUnregisterBuffer(LorieBuffer* buffer);
-void lorieSendWindowState(uint32_t window, int16_t x, int16_t y, uint16_t width, uint16_t height, uint8_t mapped, uint8_t popup, uint64_t buffer);
+void lorieSendWindowState(uint32_t window, int16_t x, int16_t y, uint16_t width, uint16_t height, uint8_t mapped, uint8_t popup, uint64_t buffer, const char *title);
 bool lorieConnectionAlive(void);
 
 __unused void rendererInit(JNIEnv* env);
@@ -167,6 +167,7 @@ typedef union {
         uint8_t mapped;        // 1 = mapped/visible, 0 = unmapped/gone
         uint8_t popup;         // 1 = override-redirect (menu/tooltip) - render as overlay, not a host window
         uint64_t buffer;       // AHardwareBuffer-backed pixmap id for this window (0 = none)
+        char title[96];        // window title (_NET_WM_NAME/WM_NAME), UTF-8, truncated
     } windowState;
 } lorieEvent;
 
