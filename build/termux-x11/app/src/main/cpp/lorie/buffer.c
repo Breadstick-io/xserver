@@ -36,6 +36,10 @@ struct LorieBuffer {
 
     GLuint id;
     EGLImage image;
+    // Set when an AHardwareBuffer-backed buffer could not be imported as an EGLImage
+    // (e.g. PowerVR on Tensor G5 rejects the import): the texture is then fed by CPU
+    // upload from the locked AHB on every bind instead of zero-copy sampling.
+    int8_t cpuUploadFallback;
     struct xorg_list link;
 };
 
@@ -424,6 +428,14 @@ __LIBC_HIDDEN__ void LorieBuffer_attachToGL(LorieBuffer* buffer) {
         int format = buffer->desc.format == AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM ? GL_BGRA_EXT : GL_RGBA;
         // The image will be updated in redraw call because of `drawRequested` flag, so we are not uploading pixels
         glTexImage2D(GL_TEXTURE_2D, 0, format, buffer->desc.stride, buffer->desc.height, 0, format, GL_UNSIGNED_BYTE, NULL);
+    } else if (buffer->desc.type == LORIEBUFFER_AHARDWAREBUFFER && buffer->desc.buffer
+               && buffer->desc.width > 0 && buffer->desc.height > 0) {
+        // EGLImage import failed (PowerVR/Tensor rejects it): allocate plain texture
+        // storage and mark the buffer for per-bind CPU upload. Slow, but it renders —
+        // without this the window stays permanently black.
+        int format = buffer->desc.format == AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM ? GL_BGRA_EXT : GL_RGBA;
+        glTexImage2D(GL_TEXTURE_2D, 0, format, buffer->desc.stride, buffer->desc.height, 0, format, GL_UNSIGNED_BYTE, NULL);
+        buffer->cpuUploadFallback = 1;
     }
 }
 
@@ -434,6 +446,16 @@ __LIBC_HIDDEN__ void LorieBuffer_bindTexture(LorieBuffer *buffer) {
     glBindTexture(GL_TEXTURE_2D, buffer->id);
     if (buffer->desc.type == LORIEBUFFER_FD)
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, buffer->desc.stride, buffer->desc.height, buffer->desc.format == AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM ? GL_BGRA_EXT : GL_RGBA, GL_UNSIGNED_BYTE, buffer->desc.data);
+    else if (buffer->cpuUploadFallback && buffer->desc.buffer) {
+        // EGLImage import failed at attach time: refresh the texture from the AHB by CPU.
+        void *pixels = NULL;
+        if (AHardwareBuffer_lock(buffer->desc.buffer, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, NULL, &pixels) == 0 && pixels) {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, buffer->desc.stride, buffer->desc.height,
+                            buffer->desc.format == AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM ? GL_BGRA_EXT : GL_RGBA,
+                            GL_UNSIGNED_BYTE, pixels);
+            AHardwareBuffer_unlock(buffer->desc.buffer, NULL);
+        }
+    }
 }
 
 __LIBC_HIDDEN__ int LorieBuffer_getWidth(LorieBuffer *buffer) {

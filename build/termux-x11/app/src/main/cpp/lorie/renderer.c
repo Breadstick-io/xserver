@@ -339,6 +339,15 @@ void rendererTestCapabilities(int* legacy_drawing) {
             return vprintEglError("Got no EGL display", __LINE__);
     }
 
+    // The display may not be initialized yet (this runs on the X server thread, possibly
+    // before the renderer thread's eglInitialize). Without this, every EGL call below
+    // fails with EGL_NOT_INITIALIZED and the capability probe is garbage — devices were
+    // being forced into (or out of) legacy drawing for the wrong reason.
+    if (eglInitialize(egl_display, NULL, NULL) != EGL_TRUE) {
+        *legacy_drawing = 1;
+        return vprintEglError("eglInitialize failed in capability test, forcing legacy drawing", __LINE__);
+    }
+
     status = AHardwareBuffer_allocate(&d0, &new);
     if (status != 0 || new == NULL) {
         loge("Failed to allocate native buffer (%p, error %d)", new, status);
