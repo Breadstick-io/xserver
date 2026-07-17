@@ -447,14 +447,25 @@ __LIBC_HIDDEN__ void LorieBuffer_bindTexture(LorieBuffer *buffer) {
     if (buffer->desc.type == LORIEBUFFER_FD)
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, buffer->desc.stride, buffer->desc.height, buffer->desc.format == AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM ? GL_BGRA_EXT : GL_RGBA, GL_UNSIGNED_BYTE, buffer->desc.data);
     else if (buffer->cpuUploadFallback && buffer->desc.buffer) {
-        // EGLImage import failed at attach time: refresh the texture from the AHB by CPU.
-        void *pixels = NULL;
-        if (AHardwareBuffer_lock(buffer->desc.buffer, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, NULL, &pixels) == 0 && pixels) {
+        // EGLImage import failed at attach time (PowerVR/Tensor): refresh the texture from
+        // the AHB by CPU. CRITICAL: the X server holds the screen pixmap's AHB CPU-locked
+        // for the whole life of the pixmap (priv->locked == buffer->lockedData, which is
+        // pPix->devPrivate.ptr). We MUST NOT take a second lock and then unlock it here — on
+        // these devices the nested unlock tears down that persistent mapping, and the next
+        // fbCopyArea on the X server thread writes to freed pages (SEGV_MAPERR use-after-free).
+        // So: if the server already holds it locked, reuse that mapping and never unlock.
+        // Only self-contained lock/unlock a buffer nobody else has locked.
+        void *pixels = buffer->lockedData;
+        bool temporary = (pixels == NULL);
+        if (temporary &&
+            AHardwareBuffer_lock(buffer->desc.buffer, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, NULL, &pixels) != 0)
+            pixels = NULL;
+        if (pixels)
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, buffer->desc.stride, buffer->desc.height,
                             buffer->desc.format == AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM ? GL_BGRA_EXT : GL_RGBA,
                             GL_UNSIGNED_BYTE, pixels);
+        if (temporary && pixels)
             AHardwareBuffer_unlock(buffer->desc.buffer, NULL);
-        }
     }
 }
 
