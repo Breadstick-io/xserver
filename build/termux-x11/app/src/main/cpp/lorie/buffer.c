@@ -169,6 +169,32 @@ static LorieBuffer* allocate(int32_t width, int32_t stride, int32_t height, int8
     return buffer;
 }
 
+// AHardwareBuffer_allocate does NOT zero the pages it hands back, unlike the other two buffer
+// types here: REGULAR comes from calloc and FD from a fresh mmap the kernel zero-fills. Whatever
+// the GPU allocator last had in that memory is simply visible.
+//
+// On the whole-screen path that never showed, because one buffer is allocated at startup behind
+// a black screen and reused. In rootless mode a buffer is allocated per top-level window and
+// again on every resize, and each one is exported to Android and drawn immediately -- before the
+// client has painted a single pixel into it. That is the "static" that clears after a few frames:
+// it is the previous contents of graphics memory, shown until the first real frame lands.
+//
+// One memset per window creation and resize. Not per frame.
+static void LorieBuffer_zeroAHardwareBuffer(AHardwareBuffer* b) {
+    AHardwareBuffer_Desc desc = {0};
+    void *data = NULL;
+
+    if (!b)
+        return;
+
+    AHardwareBuffer_describe(b, &desc);
+    if (AHardwareBuffer_lock(b, AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, NULL, &data) == 0) {
+        if (data)
+            memset(data, 0, (size_t) desc.stride * desc.height * sizeof(uint32_t));
+        AHardwareBuffer_unlock(b, NULL);
+    }
+}
+
 __LIBC_HIDDEN__ LorieBuffer* LorieBuffer_allocate(int32_t width, int32_t height, int8_t format, int8_t type) {
     int fd = -1;
     size_t size = 0;
@@ -185,6 +211,8 @@ __LIBC_HIDDEN__ LorieBuffer* LorieBuffer_allocate(int32_t width, int32_t height,
         int err = AHardwareBuffer_allocate(&desc, &ahardwarebuffer);
         if (err != 0)
             dprintf(2, "FATAL: failed to allocate AHardwareBuffer (width %d height %d format %d): error %d\n", width, height, format, err);
+        else
+            LorieBuffer_zeroAHardwareBuffer(ahardwarebuffer);
     }
 
     return allocate(width, width, height, format, type, ahardwarebuffer, fd, size, 0, true);
@@ -240,6 +268,11 @@ __LIBC_HIDDEN__ void LorieBuffer_convert(LorieBuffer* buffer, int8_t type, int8_
         AHardwareBuffer_describe(b, &desc);
 
         if (AHardwareBuffer_lock(b, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, NULL, &data) == 0) {
+            // The blt below fills width*height. The destination stride is chosen by the allocator
+            // and is usually wider, so without this the padding at the end of every row keeps
+            // whatever the allocator left there.
+            if (data)
+                memset(data, 0, (size_t) desc.stride * desc.height * sizeof(uint32_t));
             pixman_blt(buffer->desc.data, data, buffer->desc.stride, desc.stride, 32, 32, 0, 0, 0, 0, buffer->desc.width, buffer->desc.height);
             AHardwareBuffer_unlock(b, NULL);
         }
