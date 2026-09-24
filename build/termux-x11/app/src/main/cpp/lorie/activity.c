@@ -250,15 +250,20 @@ static int xcallback(int fd, int events, __unused void* data) {
                 }
                 case EVENT_WINDOW_STATE: {
                     // Geometry / mapped state — drives the live window list.
-                    jmethodID ms = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, thiz), "onWindowState", "(IIIIIZZLjava/lang/String;)V");
-                    if (ms)
+                    jmethodID ms = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, thiz), "onWindowState", "(IIIIIZZLjava/lang/String;ILjava/lang/String;)V");
+                    if (ms) {
                         e.windowState.title[sizeof(e.windowState.title) - 1] = 0;
+                        e.windowState.wmClass[sizeof(e.windowState.wmClass) - 1] = 0;
                         jstring title = (*env)->NewStringUTF(env, e.windowState.title);
+                        jstring wmClass = (*env)->NewStringUTF(env, e.windowState.wmClass);
                         (*env)->CallVoidMethod(env, thiz, ms, (jint) e.windowState.window, (jint) e.windowState.x,
                                                (jint) e.windowState.y, (jint) e.windowState.width,
                                                (jint) e.windowState.height, (jboolean) e.windowState.mapped,
-                                               (jboolean) e.windowState.popup, title);
+                                               (jboolean) e.windowState.popup, title,
+                                               (jint) e.windowState.pid, wmClass);
                         (*env)->DeleteLocalRef(env, title);
+                        (*env)->DeleteLocalRef(env, wmClass);
+                    }
                     // Pixels — hand the window's AHardwareBuffer to Java as a HardwareBuffer.
                     if (e.windowState.mapped && e.windowState.buffer) {
                         AHardwareBuffer* ahb = lorieFindBuffer(e.windowState.buffer);

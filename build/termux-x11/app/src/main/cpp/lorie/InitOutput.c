@@ -39,6 +39,7 @@
 
 #include <X11/Xatom.h>
 #include "propertyst.h"
+#include "client.h"
 #include "lorie.h"
 
 #define DRM_FORMAT_MOD_LINEAR 0
@@ -721,15 +722,45 @@ static void lorieWindowTitle(WindowPtr pWin, char *out, size_t cap) {
     }
 }
 
+// WM_CLASS as "instance\tclass". The property holds two NUL-terminated strings; the app matches
+// the pair against desktop entries (StartupWMClass, then the entry's name), which is how it knows
+// which installed app a window belongs to without guessing from the title.
+static void lorieWindowClass(WindowPtr pWin, char *out, size_t cap) {
+    PropertyPtr prop;
+    out[0] = 0;
+    if (dixLookupProperty(&prop, pWin, XA_WM_CLASS, serverClient, DixReadAccess) != Success
+            || !prop || prop->format != 8 || !prop->size)
+        return;
+    size_t n = prop->size < cap - 1 ? prop->size : cap - 1;
+    memcpy(out, prop->data, n);
+    out[n] = 0;
+    size_t first = strnlen(out, n);
+    if (first < n)
+        out[first] = '\t';
+}
+
+// The process that owns the window, as the kernel reported it for the client's socket. proot does
+// not renumber processes, so this is the real pid, and its TracerPid is the proot the app started.
+static int32_t lorieWindowPid(WindowPtr pWin) {
+    ClientPtr client = wClient(pWin);
+    if (!client || client == serverClient)
+        return -1;
+    pid_t pid = GetClientPid(client);
+    return pid > 0 ? (int32_t) pid : -1;
+}
+
 static void lorieReportWindow(WindowPtr pWin, uint8_t mapped) {
     char title[96];
+    char wmClass[64];
     if (!lorieIsTopLevel(pWin))
         return;
     uint64_t buffer = mapped ? lorieWindowBufferId(pWin) : 0;
     lorieWindowTitle(pWin, title, sizeof(title));
+    lorieWindowClass(pWin, wmClass, sizeof(wmClass));
     lorieSendWindowState((uint32_t) pWin->drawable.id, pWin->drawable.x, pWin->drawable.y,
                          pWin->drawable.width, pWin->drawable.height, mapped,
-                         pWin->overrideRedirect ? 1 : 0, buffer, title);
+                         pWin->overrideRedirect ? 1 : 0, buffer, title,
+                         lorieWindowPid(pWin), wmClass);
 }
 
 static Bool lorieRealizeWindowWrap(WindowPtr pWin) {
