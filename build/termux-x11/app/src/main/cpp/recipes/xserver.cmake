@@ -283,7 +283,11 @@ add_library(Xlorie SHARED
         "lorie/buffer.c"
         "lorie/activity.c")
 target_include_directories(Xlorie PRIVATE ${inc} "libxcvt/include")
-target_link_options(Xlorie PRIVATE "-Wl,--as-needed" "-Wl,--no-undefined" "-fvisibility=hidden")
+# 16 KB pages: max-page-size aligns the LOAD segments; common-page-size ends RELRO on a 16 KB
+# boundary, which Android 17's check demands ((VirtAddr + MemSiz) % 0x4000 == 0). The NDK's default
+# common page size is 4 KB, so libXlorie's RELRO was aligned only by chance until this.
+target_link_options(Xlorie PRIVATE "-Wl,--as-needed" "-Wl,--no-undefined" "-fvisibility=hidden"
+                    "-Wl,-z,max-page-size=16384" "-Wl,-z,common-page-size=16384")
 target_link_libraries(Xlorie "-Wl,--whole-archive" ${XSERVER_LIBS} "-Wl,--no-whole-archive" android mediandk log m z EGL GLESv2)
 target_compile_options(Xlorie PRIVATE ${compile_options})
 target_apply_patch(Xlorie "${CMAKE_CURRENT_SOURCE_DIR}/xserver" "${CMAKE_CURRENT_SOURCE_DIR}/patches/xserver.patch")

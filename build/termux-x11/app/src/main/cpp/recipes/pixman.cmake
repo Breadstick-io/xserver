@@ -83,8 +83,17 @@ if("${CMAKE_ANDROID_ARCH_ABI}" STREQUAL "armeabi-v7a")
     set(PIXMAN_CFLAGS ${PIXMAN_CFLAGS} "-DUSE_ARM_SIMD=1" "-DUSE_ARM_NEON=1" "-v")
 endif()
 
+# x86-64 (the Intel Googlebook): the SSE2 and SSSE3 fast paths. Before this the recipe only passed
+# -msse2/-mssse3 and never compiled pixman-sse2.c/pixman-ssse3.c or defined USE_SSE2/USE_SSSE3, so
+# pixman-x86.c registered no SIMD implementation at all and every blit ran the generic C paths
+# (0 sse2/ssse3 symbols in the x86_64 library, against 195 NEON symbols in the arm64 one). Both
+# are safe to assume: Android's x86-64 ABI mandates SSSE3 and SSE4.2 (ndk x86-64 ABI docs). MMX is
+# left out on purpose; SSE2 supersedes its paths and the NDK ABI has no 32-bit x86 build here.
 if ("${CMAKE_ANDROID_ARCH_ABI}" STREQUAL "x86" OR "${CMAKE_ANDROID_ARCH_ABI}" STREQUAL "x86_64")
-    set(PIXMAN_CFLAGS ${PIXMAN_CFLAGS} "-msse2" "-Winline" "-mssse3" "-Winline")
+    set(PIXMAN_SRC ${PIXMAN_SRC}
+            "pixman/pixman/pixman-sse2.c"
+            "pixman/pixman/pixman-ssse3.c")
+    set(PIXMAN_CFLAGS ${PIXMAN_CFLAGS} "-msse2" "-mssse3" "-DUSE_SSE2=1" "-DUSE_SSSE3=1" "-Winline")
 endif()
 
 add_library(pixman STATIC ${PIXMAN_SRC})
