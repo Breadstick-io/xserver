@@ -9,6 +9,7 @@
 #include <sys/socket.h>
 #include <sys/mman.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <jni.h>
 #include <android/looper.h>
 #include <wchar.h>
@@ -50,6 +51,26 @@ static void lorieRememberBuffer(uint64_t id, AHardwareBuffer* ahb) {
 static void lorieForgetBuffer(uint64_t id) {
     for (int i = 0; i < LORIE_MAX_WIN_BUFFERS; i++)
         if (lorieWinBufs[i].id == id) { lorieWinBufs[i].id = 0; lorieWinBufs[i].ahb = NULL; return; }
+}
+
+// Make [s] something NewStringUTF accepts, in place: every byte that does not belong to a
+// well-formed UTF-8 sequence becomes '?'. The X server already sends valid UTF-8; this is the second
+// line of defence, because CheckJNI (on in every debug build) aborts the WHOLE app on one bad byte,
+// and that abort then hung instead of crashing (2026-10-05, a window title cut inside "—").
+static void lorieSanitizeUtf8(char *s) {
+    unsigned char *p = (unsigned char *) s;
+    while (*p) {
+        unsigned char c = *p;
+        int k = c < 0x80 ? 1 : (c & 0xE0) == 0xC0 && c >= 0xC2 ? 2 : (c & 0xF0) == 0xE0 ? 3 : (c & 0xF8) == 0xF0 && c <= 0xF4 ? 4 : 0;
+        bool ok = k != 0;
+        for (int j = 1; ok && j < k; j++)
+            ok = (p[j] & 0xC0) == 0x80; // also stops at the NUL: 0 is not a continuation byte
+        if (!ok) {
+            *p++ = '?';
+            continue;
+        }
+        p += k;
+    }
 }
 
 static AHardwareBuffer* lorieFindBuffer(uint64_t id) {
@@ -250,17 +271,22 @@ static int xcallback(int fd, int events, __unused void* data) {
                 }
                 case EVENT_WINDOW_STATE: {
                     // Geometry / mapped state — drives the live window list.
-                    jmethodID ms = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, thiz), "onWindowState", "(IIIIIZZLjava/lang/String;ILjava/lang/String;)V");
+                    jmethodID ms = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, thiz), "onWindowState", "(IIIIIZZLjava/lang/String;ILjava/lang/String;IIIIII)V");
                     if (ms) {
                         e.windowState.title[sizeof(e.windowState.title) - 1] = 0;
                         e.windowState.wmClass[sizeof(e.windowState.wmClass) - 1] = 0;
+                        lorieSanitizeUtf8(e.windowState.title);
+                        lorieSanitizeUtf8(e.windowState.wmClass);
                         jstring title = (*env)->NewStringUTF(env, e.windowState.title);
                         jstring wmClass = (*env)->NewStringUTF(env, e.windowState.wmClass);
                         (*env)->CallVoidMethod(env, thiz, ms, (jint) e.windowState.window, (jint) e.windowState.x,
                                                (jint) e.windowState.y, (jint) e.windowState.width,
                                                (jint) e.windowState.height, (jboolean) e.windowState.mapped,
                                                (jboolean) e.windowState.popup, title,
-                                               (jint) e.windowState.pid, wmClass);
+                                               (jint) e.windowState.pid, wmClass,
+                                               (jint) e.windowState.minW, (jint) e.windowState.minH,
+                                               (jint) e.windowState.maxW, (jint) e.windowState.maxH,
+                                               (jint) e.windowState.transientFor, (jint) e.windowState.kind);
                         (*env)->DeleteLocalRef(env, title);
                         (*env)->DeleteLocalRef(env, wmClass);
                     }
@@ -480,25 +506,49 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, __unused void *reserved) {
 
 
 // It is needed to redirect stderr to logcat
+//
+// Read with read(2), never stdio. getline() on a FILE holds that FILE's lock while it waits for the
+// next line, which is nearly always. An abort (ART's, on any JNI error) flushes every stdio stream
+// first and waited on that lock forever while holding libc's list of streams, so the next thread to
+// open a FILE (the main thread, decoding a window icon) blocked too: a hang and an ANR instead of a
+// crash report (2026-10-05). Lines longer than the buffer are passed on in pieces.
 static void* stderrToLogcatThread(__unused void* cookie) {
-    FILE *fp, *logf = NULL;
+    int logfd = -1;
     int p[2];
-    size_t len;
-    char *line = NULL;
+    char buf[4096];
+    size_t have = 0;
     const char *logpath = getenv("XLORIE_LOG_FILE");
     if (logpath)
-        logf = fopen(logpath, "a");
-    pipe(p);
-
-    fp = fdopen(p[0], "r");
+        logfd = open(logpath, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
+    if (pipe(p) != 0)
+        return NULL;
 
     dup2(p[1], 2);
     dup2(p[1], 1);
-    while ((getline(&line, &len, fp)) != -1) {
-        log(DEBUG, "%s%s", line, (line[len - 1] == '\n') ? "" : "\n");
-        if (logf) {
-            fputs(line, logf);
-            fflush(logf);
+    for (;;) {
+        ssize_t n = read(p[0], buf + have, sizeof(buf) - 1 - have);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            break;
+        if (logfd >= 0)
+            (void) !write(logfd, buf + have, (size_t) n);
+        have += (size_t) n;
+        size_t start = 0;
+        for (size_t i = 0; i < have; i++) {
+            if (buf[i] == '\n') {
+                buf[i] = 0;
+                log(DEBUG, "%s\n", buf + start);
+                start = i + 1;
+            }
+        }
+        if (start == 0 && have == sizeof(buf) - 1) { // one line longer than the buffer
+            buf[have] = 0;
+            log(DEBUG, "%s\n", buf);
+            have = 0;
+        } else if (start > 0) {
+            memmove(buf, buf + start, have - start);
+            have -= start;
         }
     }
 

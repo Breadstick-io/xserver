@@ -700,7 +700,52 @@ static uint64_t lorieWindowBufferId(WindowPtr pWin) {
     return desc->id;
 }
 
-// The window's user-visible title: _NET_WM_NAME (UTF-8) preferred, WM_NAME as fallback.
+// Append the UTF-8 in [src, src + n) to out (cap bytes, NUL included), cutting only between
+// characters and turning anything that is not well-formed UTF-8 into '?'. A title cut in the middle
+// of a character (a 95-byte cap landing inside "—") reached NewStringUTF on the renderer side, and
+// CheckJNI aborts the whole app on that (2026-10-05, the Googlebook pass). Returns the new length.
+static size_t lorieAppendUtf8(char *out, size_t len, size_t cap, const uint8_t *src, size_t n) {
+    size_t i = 0;
+    while (i < n && src[i] && len + 1 < cap) {
+        uint8_t c = src[i];
+        size_t k = c < 0x80 ? 1 : (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3 : (c & 0xF8) == 0xF0 && c <= 0xF4 ? 4 : 0;
+        bool ok = k != 0 && !(k == 2 && c < 0xC2) && i + k <= n;
+        for (size_t j = 1; ok && j < k; j++)
+            ok = (src[i + j] & 0xC0) == 0x80;
+        if (!ok) {
+            out[len++] = '?';
+            i++;
+            continue;
+        }
+        if (len + k >= cap)
+            break; // the next character does not fit whole: stop before it, never inside it
+        memcpy(out + len, src + i, k);
+        len += k;
+        i += k;
+    }
+    out[len] = 0;
+    return len;
+}
+
+// Append ISO 8859-1 text (what STRING properties hold: WM_NAME, WM_CLASS) as UTF-8.
+static size_t lorieAppendLatin1(char *out, size_t len, size_t cap, const uint8_t *src, size_t n) {
+    for (size_t i = 0; i < n && src[i]; i++) {
+        uint8_t c = src[i];
+        if (c < 0x80) {
+            if (len + 1 >= cap) break;
+            out[len++] = (char) c;
+        } else {
+            if (len + 2 >= cap) break;
+            out[len++] = (char) (0xC0 | (c >> 6));
+            out[len++] = (char) (0x80 | (c & 0x3F));
+        }
+    }
+    out[len] = 0;
+    return len;
+}
+
+// The window's user-visible title: _NET_WM_NAME (UTF-8) preferred, WM_NAME as fallback. Always
+// valid UTF-8, truncated between characters.
 static void lorieWindowTitle(WindowPtr pWin, char *out, size_t cap) {
     static Atom netWmName, utf8String;
     PropertyPtr prop;
@@ -711,32 +756,103 @@ static void lorieWindowTitle(WindowPtr pWin, char *out, size_t cap) {
     }
     if (dixLookupProperty(&prop, pWin, netWmName, serverClient, DixReadAccess) == Success
             && prop && prop->type == utf8String && prop->format == 8 && prop->size) {
-        size_t n = prop->size < cap - 1 ? prop->size : cap - 1;
-        memcpy(out, prop->data, n); out[n] = 0;
+        lorieAppendUtf8(out, 0, cap, prop->data, prop->size);
         return;
     }
     if (dixLookupProperty(&prop, pWin, XA_WM_NAME, serverClient, DixReadAccess) == Success
             && prop && prop->format == 8 && prop->size) {
-        size_t n = prop->size < cap - 1 ? prop->size : cap - 1;
-        memcpy(out, prop->data, n); out[n] = 0;
+        if (prop->type == utf8String) {
+            lorieAppendUtf8(out, 0, cap, prop->data, prop->size);
+        } else if (prop->type == XA_STRING) {
+            lorieAppendLatin1(out, 0, cap, prop->data, prop->size);
+        } else {
+            // COMPOUND_TEXT and anything else: its plain ASCII, without the escape sequences.
+            size_t len = 0;
+            const uint8_t *d = prop->data;
+            for (size_t i = 0; i < (size_t) prop->size && d[i] && len + 1 < cap; i++)
+                if (d[i] >= 0x20 && d[i] < 0x7F) out[len++] = (char) d[i];
+            out[len] = 0;
+        }
     }
 }
 
-// WM_CLASS as "instance\tclass". The property holds two NUL-terminated strings; the app matches
-// the pair against desktop entries (StartupWMClass, then the entry's name), which is how it knows
-// which installed app a window belongs to without guessing from the title.
+// WM_CLASS as "instance\tclass". The property holds two NUL-terminated ISO 8859-1 strings; the app
+// matches the pair against desktop entries (StartupWMClass, then the entry's name), which is how it
+// knows which installed app a window belongs to without guessing from the title.
 static void lorieWindowClass(WindowPtr pWin, char *out, size_t cap) {
     PropertyPtr prop;
     out[0] = 0;
     if (dixLookupProperty(&prop, pWin, XA_WM_CLASS, serverClient, DixReadAccess) != Success
             || !prop || prop->format != 8 || !prop->size)
         return;
-    size_t n = prop->size < cap - 1 ? prop->size : cap - 1;
-    memcpy(out, prop->data, n);
-    out[n] = 0;
-    size_t first = strnlen(out, n);
-    if (first < n)
-        out[first] = '\t';
+    const uint8_t *d = prop->data;
+    size_t n = prop->size;
+    size_t first = strnlen((const char *) d, n);
+    size_t len = lorieAppendLatin1(out, 0, cap, d, first);
+    if (first < n && len + 1 < cap) {
+        out[len++] = '\t';
+        out[len] = 0;
+        lorieAppendLatin1(out, len, cap, d + first + 1, n - first - 1);
+    }
+}
+
+// What kind of window this is, from _NET_WM_WINDOW_TYPE (the first type it lists that we know):
+// 0 normal (or none given), 1 dialog, 2 splash, 3 anything else that is not an app's main window
+// (utility, toolbar, notification, ...). The app uses it to keep splash screens and dialogs from
+// being remembered as the app's place.
+static uint8_t lorieWindowKind(WindowPtr pWin) {
+    static Atom wmType, tNormal, tDialog, tSplash;
+    PropertyPtr prop;
+    if (!wmType) {
+        wmType = MakeAtom("_NET_WM_WINDOW_TYPE", 19, TRUE);
+        tNormal = MakeAtom("_NET_WM_WINDOW_TYPE_NORMAL", 26, TRUE);
+        tDialog = MakeAtom("_NET_WM_WINDOW_TYPE_DIALOG", 26, TRUE);
+        tSplash = MakeAtom("_NET_WM_WINDOW_TYPE_SPLASH", 26, TRUE);
+    }
+    if (dixLookupProperty(&prop, pWin, wmType, serverClient, DixReadAccess) != Success
+            || !prop || prop->format != 32 || prop->type != XA_ATOM || !prop->size)
+        return 0;
+    const CARD32 *atoms = (const CARD32 *) prop->data;
+    for (unsigned long i = 0; i < prop->size; i++) {
+        if (atoms[i] == tNormal) return 0;
+        if (atoms[i] == tDialog) return 1;
+        if (atoms[i] == tSplash) return 2;
+    }
+    return 3;
+}
+
+// WM_TRANSIENT_FOR: the window this one belongs to (a dialog's parent), 0 when none.
+static uint32_t lorieWindowTransientFor(WindowPtr pWin) {
+    PropertyPtr prop;
+    if (dixLookupProperty(&prop, pWin, XA_WM_TRANSIENT_FOR, serverClient, DixReadAccess) != Success
+            || !prop || prop->format != 32 || !prop->size)
+        return 0;
+    return ((const CARD32 *) prop->data)[0];
+}
+
+// The smallest and largest size the window accepts (WM_NORMAL_HINTS), 0 where it says nothing.
+// The base size stands in for a missing minimum, as ICCCM says.
+static void lorieWindowSizeHints(WindowPtr pWin, uint16_t *minW, uint16_t *minH, uint16_t *maxW, uint16_t *maxH) {
+    PropertyPtr prop;
+    *minW = *minH = *maxW = *maxH = 0;
+    if (dixLookupProperty(&prop, pWin, XA_WM_NORMAL_HINTS, serverClient, DixReadAccess) != Success
+            || !prop || prop->format != 32 || prop->size < 9)
+        return;
+    const CARD32 *h = (const CARD32 *) prop->data;
+    CARD32 flags = h[0];
+    #define LORIE_HINT(v) ((uint16_t) ((int32_t) (v) <= 0 ? 0 : (v) > 65535 ? 65535 : (v)))
+    if (flags & (1L << 4)) { // PMinSize
+        *minW = LORIE_HINT(h[5]);
+        *minH = LORIE_HINT(h[6]);
+    } else if ((flags & (1L << 8)) && prop->size >= 17) { // PBaseSize
+        *minW = LORIE_HINT(h[15]);
+        *minH = LORIE_HINT(h[16]);
+    }
+    if (flags & (1L << 5)) { // PMaxSize
+        *maxW = LORIE_HINT(h[7]);
+        *maxH = LORIE_HINT(h[8]);
+    }
+    #undef LORIE_HINT
 }
 
 // The process that owns the window, as the kernel reported it for the client's socket. proot does
@@ -752,15 +868,70 @@ static int32_t lorieWindowPid(WindowPtr pWin) {
 static void lorieReportWindow(WindowPtr pWin, uint8_t mapped) {
     char title[96];
     char wmClass[64];
+    uint16_t minW, minH, maxW, maxH;
     if (!lorieIsTopLevel(pWin))
         return;
     uint64_t buffer = mapped ? lorieWindowBufferId(pWin) : 0;
     lorieWindowTitle(pWin, title, sizeof(title));
     lorieWindowClass(pWin, wmClass, sizeof(wmClass));
+    lorieWindowSizeHints(pWin, &minW, &minH, &maxW, &maxH);
     lorieSendWindowState((uint32_t) pWin->drawable.id, pWin->drawable.x, pWin->drawable.y,
                          pWin->drawable.width, pWin->drawable.height, mapped,
                          pWin->overrideRedirect ? 1 : 0, buffer, title,
-                         lorieWindowPid(pWin), wmClass);
+                         lorieWindowPid(pWin), wmClass, minW, minH, maxW, maxH,
+                         lorieWindowTransientFor(pWin), lorieWindowKind(pWin));
+}
+
+// A mapped top-level window changed a property the app shows or decides by (its title, its class,
+// its kind, its size limits, its parent): report it again. Until this, only a map, a move or a new
+// pixmap reported a window, so a retitle that did not resize never reached the taskbar, and
+// LibreOffice's frame kept the class "soffice" it mapped with although it became
+// libreoffice-writer 0.14 s later. Collected and sent from a timer, 30 ms on: properties often
+// change in bursts, and a delete is announced while the old value is still there.
+#define LORIE_DIRTY_MAX 32
+static XID lorieDirty[LORIE_DIRTY_MAX];
+static int lorieDirtyCount;
+static OsTimerPtr lorieDirtyTimer;
+static Bool lorieDirtyArmed;
+
+static CARD32 lorieReportDirty(unused OsTimerPtr timer, unused CARD32 time, unused void *arg) {
+    int n = lorieDirtyCount;
+    lorieDirtyCount = 0;
+    lorieDirtyArmed = FALSE;
+    for (int i = 0; i < n; i++) {
+        WindowPtr pWin;
+        if (dixLookupWindow(&pWin, lorieDirty[i], serverClient, DixGetAttrAccess) == Success
+                && pWin && pWin->realized && lorieIsTopLevel(pWin))
+            lorieReportWindow(pWin, 1);
+    }
+    return 0;
+}
+
+static void loriePropertyChanged(unused CallbackListPtr *pcbl, unused void *closure, void *data) {
+    static Atom netWmName, wmType;
+    PropertyStateRec *rec = data;
+    if (!rec || !rec->win || !rec->prop || !rec->win->realized || !lorieIsTopLevel(rec->win))
+        return;
+    if (!netWmName) {
+        netWmName = MakeAtom("_NET_WM_NAME", 12, TRUE);
+        wmType = MakeAtom("_NET_WM_WINDOW_TYPE", 19, TRUE);
+    }
+    Atom a = rec->prop->propertyName;
+    if (a != netWmName && a != XA_WM_NAME && a != XA_WM_CLASS && a != wmType
+            && a != XA_WM_NORMAL_HINTS && a != XA_WM_TRANSIENT_FOR)
+        return;
+    XID id = rec->win->drawable.id;
+    for (int i = 0; i < lorieDirtyCount; i++)
+        if (lorieDirty[i] == id)
+            return;
+    if (lorieDirtyCount < LORIE_DIRTY_MAX)
+        lorieDirty[lorieDirtyCount++] = id;
+    // Armed once per batch, never pushed back: a program retitling itself every few milliseconds
+    // (a terminal, a progress counter) would otherwise keep the report from ever going out.
+    if (!lorieDirtyArmed) {
+        lorieDirtyArmed = TRUE;
+        lorieDirtyTimer = TimerSet(lorieDirtyTimer, 0, 30, lorieReportDirty, NULL);
+    }
 }
 
 static Bool lorieRealizeWindowWrap(WindowPtr pWin) {
@@ -832,6 +1003,7 @@ static Bool lorieScreenInit(ScreenPtr pScreen, unused int argc, unused char **ar
         pScreen->PositionWindow = loriePositionWindowWrap;
         lorieDestroyWindow = pScreen->DestroyWindow;
         pScreen->DestroyWindow = lorieDestroyWindowWrap;
+        AddCallback(&PropertyStateCallback, loriePropertyChanged, NULL);
     }
 
     ShmRegisterFbFuncs(pScreen);

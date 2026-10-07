@@ -34,7 +34,8 @@ void lorieActivityConnected(void);
 void lorieSendSharedServerState(int memfd);
 void lorieRegisterBuffer(LorieBuffer* buffer);
 void lorieUnregisterBuffer(LorieBuffer* buffer);
-void lorieSendWindowState(uint32_t window, int16_t x, int16_t y, uint16_t width, uint16_t height, uint8_t mapped, uint8_t popup, uint64_t buffer, const char *title, int32_t pid, const char *wmClass);
+void lorieSendWindowState(uint32_t window, int16_t x, int16_t y, uint16_t width, uint16_t height, uint8_t mapped, uint8_t popup, uint64_t buffer, const char *title, int32_t pid, const char *wmClass,
+                          uint16_t minW, uint16_t minH, uint16_t maxW, uint16_t maxH, uint32_t transientFor, uint8_t kind);
 bool lorieConnectionAlive(void);
 
 __unused void rendererInit(JNIEnv* env);
@@ -167,9 +168,13 @@ typedef union {
         uint8_t mapped;        // 1 = mapped/visible, 0 = unmapped/gone
         uint8_t popup;         // 1 = override-redirect (menu/tooltip) - render as overlay, not a host window
         uint64_t buffer;       // AHardwareBuffer-backed pixmap id for this window (0 = none)
-        char title[96];        // window title (_NET_WM_NAME/WM_NAME), UTF-8, truncated
+        char title[96];        // window title (_NET_WM_NAME/WM_NAME), valid UTF-8, cut between characters
         int32_t pid;           // the owning client's process id (from the socket), -1 if unknown
         char wmClass[64];      // WM_CLASS as "instance\tclass", truncated; empty when unset
+        uint16_t minW, minH;   // WM_NORMAL_HINTS minimum (or base) size, 0 = none
+        uint16_t maxW, maxH;   // WM_NORMAL_HINTS maximum size, 0 = none
+        uint32_t transientFor; // WM_TRANSIENT_FOR, 0 = none
+        uint8_t kind;          // _NET_WM_WINDOW_TYPE: 0 normal/none, 1 dialog, 2 splash, 3 other
     } windowState;
 } lorieEvent;
 
