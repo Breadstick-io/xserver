@@ -809,17 +809,20 @@ static void lorieWindowClass(WindowPtr pWin, char *out, size_t cap) {
 }
 
 // What kind of window this is, from _NET_WM_WINDOW_TYPE (the first type it lists that we know):
-// 0 normal (or none given), 1 dialog, 2 splash, 3 anything else that is not an app's main window
-// (utility, toolbar, notification, ...). The app uses it to keep splash screens and dialogs from
-// being remembered as the app's place.
+// 0 normal (or none given), 1 dialog, 2 splash, 4 tooltip, 5 notification, 3 anything else that is
+// not an app's main window (utility, toolbar, menu, ...). The app uses it to keep splash screens and
+// dialogs from being remembered as the app's place, and the Enhanced Desktop to tell a menu, which
+// holds the pointer while it is open, from a tooltip, which does not.
 static uint8_t lorieWindowKind(WindowPtr pWin) {
-    static Atom wmType, tNormal, tDialog, tSplash;
+    static Atom wmType, tNormal, tDialog, tSplash, tTooltip, tNotification;
     PropertyPtr prop;
     if (!wmType) {
         wmType = MakeAtom("_NET_WM_WINDOW_TYPE", 19, TRUE);
         tNormal = MakeAtom("_NET_WM_WINDOW_TYPE_NORMAL", 26, TRUE);
         tDialog = MakeAtom("_NET_WM_WINDOW_TYPE_DIALOG", 26, TRUE);
         tSplash = MakeAtom("_NET_WM_WINDOW_TYPE_SPLASH", 26, TRUE);
+        tTooltip = MakeAtom("_NET_WM_WINDOW_TYPE_TOOLTIP", 27, TRUE);
+        tNotification = MakeAtom("_NET_WM_WINDOW_TYPE_NOTIFICATION", 32, TRUE);
     }
     if (dixLookupProperty(&prop, pWin, wmType, serverClient, DixReadAccess) != Success
             || !prop || prop->format != 32 || prop->type != XA_ATOM || !prop->size)
@@ -829,6 +832,8 @@ static uint8_t lorieWindowKind(WindowPtr pWin) {
         if (atoms[i] == tNormal) return 0;
         if (atoms[i] == tDialog) return 1;
         if (atoms[i] == tSplash) return 2;
+        if (atoms[i] == tTooltip) return 4;
+        if (atoms[i] == tNotification) return 5;
     }
     return 3;
 }
@@ -1217,6 +1222,7 @@ Bool lorieWindowCommand(unused ClientPtr pClient, void *closure) {
     WindowPtr pWin;
     if (!e)
         return TRUE;
+    lorieInputOrderDone();
     if (!lorieRootlessEnabled() || !pScreenPtr
             || dixLookupWindow(&pWin, e->windowCommand.window, serverClient, DixManageAccess) != Success
             || !lorieIsTopLevel(pWin)) {

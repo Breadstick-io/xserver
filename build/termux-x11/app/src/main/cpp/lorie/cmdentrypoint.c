@@ -263,10 +263,36 @@ static Bool handleTouchEvent(__unused ClientPtr pClient, void *closure) {
     return TRUE;
 }
 
+// Window commands run on the main loop, later than the input that follows them would: the main
+// loop delivers queued input before it runs its work queue, so a click sent right after "raise this
+// window" reached whichever window was on top before the raise. While a command is waiting, the
+// pointer and keyboard events behind it wait in the same queue, in order; once it has run, input
+// goes straight through again. Counted on the input thread, uncounted on the main loop.
+static volatile int lorieOrderPending = 0;
+
+void lorieInputOrderQueued(void) {
+    __atomic_add_fetch(&lorieOrderPending, 1, __ATOMIC_SEQ_CST);
+}
+
+void lorieInputOrderDone(void) {
+    __atomic_sub_fetch(&lorieOrderPending, 1, __ATOMIC_SEQ_CST);
+}
+
+static void lorieApplyInputEvent(lorieEvent *ev);
+
+static Bool lorieDeferredInput(__unused ClientPtr pClient, void *closure) {
+    lorieEvent *ev = closure;
+    // The input thread queues events holding this lock; from the main loop it must be taken.
+    input_lock();
+    lorieApplyInputEvent(ev);
+    input_unlock();
+    lorieInputOrderDone();
+    free(ev);
+    return TRUE;
+}
+
 void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
-    ValuatorMask mask;
     lorieEvent e = {0};
-    valuator_mask_zero(&mask);
 
     if (ready & X_NOTIFY_ERROR) {
         LorieBuffer* buf;
@@ -299,94 +325,26 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
                 lorieWakeServer();
                 break;
             }
-            case EVENT_STYLUS: {
-                static int buttons_prev = 0;
-                uint32_t released, pressed, diff;
-                DeviceIntPtr device = e.stylus.mouse ? lorieMouse : (e.stylus.eraser ? lorieEraser : loriePen);
-                if (!device) {
-                    __android_log_print(ANDROID_LOG_DEBUG, "LorieNative", "got stylus event but device is not requested\n");
-                    break;
-                }
-                __android_log_print(ANDROID_LOG_DEBUG, "LorieNative", "got stylus event %f %f %d %d %d %d %s\n", e.stylus.x, e.stylus.y, e.stylus.pressure, e.stylus.tilt_x, e.stylus.tilt_y, e.stylus.orientation,
-                                    device == lorieMouse ? "lorieMouse" : (device == loriePen ? "loriePen" : "lorieEraser"));
-
-                valuator_mask_set_double(&mask, 0, max(min(e.stylus.x, pScreenPtr->width), 0));
-                valuator_mask_set_double(&mask, 1, max(min(e.stylus.y, pScreenPtr->height), 0));
-                if (device != lorieMouse) {
-                    valuator_mask_set_double(&mask, 2, e.stylus.pressure);
-                    valuator_mask_set_double(&mask, 3, e.stylus.tilt_x);
-                    valuator_mask_set_double(&mask, 4, e.stylus.tilt_y);
-                    valuator_mask_set_double(&mask, 5, e.stylus.orientation);
-                }
-                QueuePointerEvents(device, MotionNotify, 0, POINTER_ABSOLUTE | POINTER_DESKTOP | (device == lorieMouse ? POINTER_NORAW : 0), &mask);
-
-                diff = buttons_prev ^ e.stylus.buttons;
-                released = diff & ~e.stylus.buttons;
-                pressed = diff & e.stylus.buttons;
-
-                for (int i=0; i<3; i++) {
-                    if (released & 0x1) {
-                        QueuePointerEvents(device, ButtonRelease, i + 1, POINTER_RELATIVE, NULL);
-                        __android_log_print(ANDROID_LOG_DEBUG, "LorieNative", "sending %d press", i+1);
-                    }
-                    if (pressed & 0x1) {
-                        QueuePointerEvents(device, ButtonPress, i + 1, POINTER_RELATIVE, NULL);
-                        __android_log_print(ANDROID_LOG_DEBUG, "LorieNative", "sending %d release", i+1);
-                    }
-                    released >>= 1;
-                    pressed >>= 1;
-                }
-                buttons_prev = e.stylus.buttons;
-
-                break;
-            }
             case EVENT_STYLUS_ENABLE: {
                 lorieSetStylusEnabled(e.stylusEnable.enable);
                 break;
             }
-            case EVENT_MOUSE: {
-                int flags;
-                switch(e.mouse.detail) {
-                    case 0: // BUTTON_UNDEFINED
-                        flags = (e.mouse.relative) ? POINTER_RELATIVE | POINTER_ACCELERATE : POINTER_ABSOLUTE | POINTER_SCREEN | POINTER_NORAW;
-                        if (!e.mouse.relative) {
-                            e.mouse.x = max(0, min(e.mouse.x, pScreenPtr->width));
-                            e.mouse.y = max(0, min(e.mouse.y, pScreenPtr->height));
-                        }
-                        valuator_mask_set_double(&mask, 0, (double) e.mouse.x);
-                        valuator_mask_set_double(&mask, 1, (double) e.mouse.y);
-                        QueuePointerEvents(lorieMouse, MotionNotify, 0, flags, &mask);
-                        break;
-                    case 1: // BUTTON_LEFT
-                    case 2: // BUTTON_MIDDLE
-                    case 3: // BUTTON_RIGHT
-                        QueuePointerEvents(lorieMouse, e.mouse.down ? ButtonPress : ButtonRelease, e.mouse.detail, POINTER_RELATIVE, NULL);
-                        break;
-                    case 4: // BUTTON_SCROLL
-                        if (e.mouse.x) {
-                            valuator_mask_zero(&mask);
-                            valuator_mask_set_double(&mask, 2, (double) e.mouse.x / 120);
-                            QueuePointerEvents(lorieMouse, MotionNotify, 0, POINTER_RELATIVE, &mask);
-                        }
-                        if (e.mouse.y) {
-                            valuator_mask_zero(&mask);
-                            valuator_mask_set_double(&mask, 3, (double) e.mouse.y / 120);
-                            QueuePointerEvents(lorieMouse, MotionNotify, 0, POINTER_RELATIVE, &mask);
-                        }
-                        break;
-                }
-                break;
-            }
+            case EVENT_STYLUS:
+            case EVENT_MOUSE:
             case EVENT_KEY:
-                QueueKeyboardEvents(lorieKeyboard, e.key.state ? KeyPress : KeyRelease, e.key.key);
+            case EVENT_UNICODE:
+                if (__atomic_load_n(&lorieOrderPending, __ATOMIC_SEQ_CST) > 0) {
+                    lorieEvent *copy = calloc(1, sizeof(lorieEvent));
+                    if (copy) {
+                        memcpy(copy, &e, sizeof(e));
+                        lorieInputOrderQueued();
+                        QueueWorkProc(lorieDeferredInput, NULL, copy);
+                        lorieWakeServer();
+                        break;
+                    }
+                }
+                lorieApplyInputEvent(&e);
                 break;
-            case EVENT_UNICODE: {
-                int ks = ucs2keysym((long) e.unicode.code);
-                __android_log_print(ANDROID_LOG_DEBUG, "LorieNative", "Trying to input keysym %d\n", ks);
-                lorieKeysymKeyboardEvent(ks, TRUE);
-                lorieKeysymKeyboardEvent(ks, FALSE);
-                break;
-            }
             case EVENT_CLIPBOARD_ENABLE:
                 lorieEnableClipboardSync(e.clipboardEnable.enable);
                 break;
@@ -410,6 +368,7 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
                 lorieEvent *copy = calloc(1, sizeof(lorieEvent));
                 if (copy) {
                     memcpy(copy, &e, sizeof(e));
+                    lorieInputOrderQueued(); // lorieWindowCommand counts it done
                     QueueWorkProc(lorieWindowCommand, NULL, copy);
                     lorieWakeServer();
                 }
@@ -420,6 +379,101 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
         int n;
         if (ioctl(fd, FIONREAD, &n) >= 0 && n > sizeof(e))
             goto again;
+    }
+}
+
+// A pointer, stylus or keyboard event from the app, delivered: on the input thread, or from the
+// main loop when it had to wait behind a window command (lorieDeferredInput).
+static void lorieApplyInputEvent(lorieEvent *ev) {
+    ValuatorMask mask;
+    valuator_mask_zero(&mask);
+    switch (ev->type) {
+            case EVENT_STYLUS: {
+                static int buttons_prev = 0;
+                uint32_t released, pressed, diff;
+                DeviceIntPtr device = ev->stylus.mouse ? lorieMouse : (ev->stylus.eraser ? lorieEraser : loriePen);
+                if (!device) {
+                    __android_log_print(ANDROID_LOG_DEBUG, "LorieNative", "got stylus event but device is not requested\n");
+                    break;
+                }
+                __android_log_print(ANDROID_LOG_DEBUG, "LorieNative", "got stylus event %f %f %d %d %d %d %s\n", ev->stylus.x, ev->stylus.y, ev->stylus.pressure, ev->stylus.tilt_x, ev->stylus.tilt_y, ev->stylus.orientation,
+                                    device == lorieMouse ? "lorieMouse" : (device == loriePen ? "loriePen" : "lorieEraser"));
+
+                valuator_mask_set_double(&mask, 0, max(min(ev->stylus.x, pScreenPtr->width), 0));
+                valuator_mask_set_double(&mask, 1, max(min(ev->stylus.y, pScreenPtr->height), 0));
+                if (device != lorieMouse) {
+                    valuator_mask_set_double(&mask, 2, ev->stylus.pressure);
+                    valuator_mask_set_double(&mask, 3, ev->stylus.tilt_x);
+                    valuator_mask_set_double(&mask, 4, ev->stylus.tilt_y);
+                    valuator_mask_set_double(&mask, 5, ev->stylus.orientation);
+                }
+                QueuePointerEvents(device, MotionNotify, 0, POINTER_ABSOLUTE | POINTER_DESKTOP | (device == lorieMouse ? POINTER_NORAW : 0), &mask);
+
+                diff = buttons_prev ^ ev->stylus.buttons;
+                released = diff & ~ev->stylus.buttons;
+                pressed = diff & ev->stylus.buttons;
+
+                for (int i=0; i<3; i++) {
+                    if (released & 0x1) {
+                        QueuePointerEvents(device, ButtonRelease, i + 1, POINTER_RELATIVE, NULL);
+                        __android_log_print(ANDROID_LOG_DEBUG, "LorieNative", "sending %d press", i+1);
+                    }
+                    if (pressed & 0x1) {
+                        QueuePointerEvents(device, ButtonPress, i + 1, POINTER_RELATIVE, NULL);
+                        __android_log_print(ANDROID_LOG_DEBUG, "LorieNative", "sending %d release", i+1);
+                    }
+                    released >>= 1;
+                    pressed >>= 1;
+                }
+                buttons_prev = ev->stylus.buttons;
+
+                break;
+            }
+            case EVENT_MOUSE: {
+                int flags;
+                switch(ev->mouse.detail) {
+                    case 0: // BUTTON_UNDEFINED
+                        flags = (ev->mouse.relative) ? POINTER_RELATIVE | POINTER_ACCELERATE : POINTER_ABSOLUTE | POINTER_SCREEN | POINTER_NORAW;
+                        if (!ev->mouse.relative) {
+                            ev->mouse.x = max(0, min(ev->mouse.x, pScreenPtr->width));
+                            ev->mouse.y = max(0, min(ev->mouse.y, pScreenPtr->height));
+                        }
+                        valuator_mask_set_double(&mask, 0, (double) ev->mouse.x);
+                        valuator_mask_set_double(&mask, 1, (double) ev->mouse.y);
+                        QueuePointerEvents(lorieMouse, MotionNotify, 0, flags, &mask);
+                        break;
+                    case 1: // BUTTON_LEFT
+                    case 2: // BUTTON_MIDDLE
+                    case 3: // BUTTON_RIGHT
+                        QueuePointerEvents(lorieMouse, ev->mouse.down ? ButtonPress : ButtonRelease, ev->mouse.detail, POINTER_RELATIVE, NULL);
+                        break;
+                    case 4: // BUTTON_SCROLL
+                        if (ev->mouse.x) {
+                            valuator_mask_zero(&mask);
+                            valuator_mask_set_double(&mask, 2, (double) ev->mouse.x / 120);
+                            QueuePointerEvents(lorieMouse, MotionNotify, 0, POINTER_RELATIVE, &mask);
+                        }
+                        if (ev->mouse.y) {
+                            valuator_mask_zero(&mask);
+                            valuator_mask_set_double(&mask, 3, (double) ev->mouse.y / 120);
+                            QueuePointerEvents(lorieMouse, MotionNotify, 0, POINTER_RELATIVE, &mask);
+                        }
+                        break;
+                }
+                break;
+            }
+            case EVENT_KEY:
+                QueueKeyboardEvents(lorieKeyboard, ev->key.state ? KeyPress : KeyRelease, ev->key.key);
+                break;
+            case EVENT_UNICODE: {
+                int ks = ucs2keysym((long) ev->unicode.code);
+                __android_log_print(ANDROID_LOG_DEBUG, "LorieNative", "Trying to input keysym %d\n", ks);
+                lorieKeysymKeyboardEvent(ks, TRUE);
+                lorieKeysymKeyboardEvent(ks, FALSE);
+                break;
+            }
+        default:
+            break;
     }
 }
 

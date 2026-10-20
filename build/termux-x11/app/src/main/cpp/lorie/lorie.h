@@ -40,6 +40,8 @@ void lorieSendWindowState(uint32_t window, int16_t x, int16_t y, uint16_t width,
 void lorieSendWindowDamage(uint32_t window);
 void lorieSendWindowRequest(uint32_t window, uint8_t request, int32_t a, int32_t b, int32_t c, int32_t d);
 Bool lorieWindowCommand(struct _Client *pClient, void *closure); // QueueWorkProc: runs on the X main loop
+void lorieInputOrderQueued(void);
+void lorieInputOrderDone(void);
 bool lorieConnectionAlive(void);
 
 __unused void rendererInit(JNIEnv* env);
