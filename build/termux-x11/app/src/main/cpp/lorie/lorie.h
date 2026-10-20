@@ -35,7 +35,11 @@ void lorieSendSharedServerState(int memfd);
 void lorieRegisterBuffer(LorieBuffer* buffer);
 void lorieUnregisterBuffer(LorieBuffer* buffer);
 void lorieSendWindowState(uint32_t window, int16_t x, int16_t y, uint16_t width, uint16_t height, uint8_t mapped, uint8_t popup, uint64_t buffer, const char *title, int32_t pid, const char *wmClass,
-                          uint16_t minW, uint16_t minH, uint16_t maxW, uint16_t maxH, uint32_t transientFor, uint8_t kind);
+                          uint16_t minW, uint16_t minH, uint16_t maxW, uint16_t maxH, uint32_t transientFor, uint8_t kind,
+                          uint8_t flags, const uint16_t *frame);
+void lorieSendWindowDamage(uint32_t window);
+void lorieSendWindowRequest(uint32_t window, uint8_t request, int32_t a, int32_t b, int32_t c, int32_t d);
+Bool lorieWindowCommand(struct _Client *pClient, void *closure); // QueueWorkProc: runs on the X main loop
 bool lorieConnectionAlive(void);
 
 __unused void rendererInit(JNIEnv* env);
@@ -109,7 +113,40 @@ typedef enum {
     EVENT_CLIPBOARD_SEND,
     EVENT_WINDOW_FOCUS_CHANGED,
     EVENT_WINDOW_STATE, // Breadstick rootless: top-level window geometry / mapped state
+    EVENT_WINDOW_DAMAGE, // Breadstick rootless: a top-level window's pixels changed (at most once a frame)
+    EVENT_WINDOW_REQUEST, // Breadstick rootless: a client asked the window manager for something (move, state, ...)
+    EVENT_WINDOW_COMMAND, // Breadstick rootless, app to server: move, resize, raise, focus, close, set state
 } eventType;
+
+// EVENT_WINDOW_STATE flags: what the window says about its own frame and state.
+#define LORIE_WINDOW_UNDECORATED 1   // _MOTIF_WM_HINTS asks for no decorations: it draws its own (or none)
+#define LORIE_WINDOW_FRAME_EXTENTS 2 // _GTK_FRAME_EXTENTS is set: client-side decorations with a margin
+#define LORIE_WINDOW_FULLSCREEN 4    // _NET_WM_STATE holds _NET_WM_STATE_FULLSCREEN
+#define LORIE_WINDOW_MAXIMIZED 8     // _NET_WM_STATE holds both _NET_WM_STATE_MAXIMIZED_VERT and _HORZ
+#define LORIE_WINDOW_HIDDEN 16       // _NET_WM_STATE holds _NET_WM_STATE_HIDDEN
+
+// EVENT_WINDOW_REQUEST kinds, and the state bits a STATE request carries in b.
+#define LORIE_REQUEST_MOVERESIZE 1   // _NET_WM_MOVERESIZE: a = x_root, b = y_root, c = direction, d = button
+#define LORIE_REQUEST_STATE 2        // _NET_WM_STATE: a = action (0 remove, 1 add, 2 toggle), b = LORIE_STATE_* bits
+#define LORIE_REQUEST_ACTIVATE 3     // _NET_ACTIVE_WINDOW
+#define LORIE_REQUEST_ICONIFY 4      // WM_CHANGE_STATE to IconicState
+#define LORIE_REQUEST_CLOSE 5        // _NET_CLOSE_WINDOW
+#define LORIE_REQUEST_MOVERESIZE_WINDOW 6 // _NET_MOVERESIZE_WINDOW: a, b, c, d = x, y, width, height (-1 where not given)
+#define LORIE_STATE_MAXIMIZED_VERT 1
+#define LORIE_STATE_MAXIMIZED_HORZ 2
+#define LORIE_STATE_FULLSCREEN 4
+#define LORIE_STATE_HIDDEN 8
+#define LORIE_STATE_ABOVE 16
+
+// EVENT_WINDOW_COMMAND operations.
+#define LORIE_COMMAND_MOVE 1         // x, y
+#define LORIE_COMMAND_RESIZE 2       // w, h
+#define LORIE_COMMAND_MOVE_RESIZE 3  // x, y, w, h
+#define LORIE_COMMAND_RAISE 4
+#define LORIE_COMMAND_FOCUS 5        // raise, give it the keyboard focus, and name it _NET_ACTIVE_WINDOW
+#define LORIE_COMMAND_CLOSE 6        // WM_DELETE_WINDOW, when the window takes it
+#define LORIE_COMMAND_SET_STATE 7    // x = LORIE_STATE_* bits, written as the window's _NET_WM_STATE
+#define LORIE_COMMAND_LOWER 8
 
 typedef union {
     uint8_t type;
@@ -175,7 +212,25 @@ typedef union {
         uint16_t maxW, maxH;   // WM_NORMAL_HINTS maximum size, 0 = none
         uint32_t transientFor; // WM_TRANSIENT_FOR, 0 = none
         uint8_t kind;          // _NET_WM_WINDOW_TYPE: 0 normal/none, 1 dialog, 2 splash, 3 other
+        uint8_t flags;         // LORIE_WINDOW_* bits
+        uint16_t frame[4];     // _GTK_FRAME_EXTENTS: left, right, top, bottom (the margin a client-decorated window draws around itself)
     } windowState;
+    struct {
+        uint8_t t;
+        uint32_t window;
+    } windowDamage;
+    struct {
+        uint8_t t;
+        uint8_t request;       // LORIE_REQUEST_*
+        uint32_t window;
+        int32_t a, b, c, d;
+    } windowRequest;
+    struct {
+        uint8_t t;
+        uint8_t op;            // LORIE_COMMAND_*
+        uint32_t window;
+        int32_t x, y, w, h;
+    } windowCommand;
 } lorieEvent;
 
 struct lorie_shared_server_state {

@@ -40,6 +40,8 @@
 #include <X11/Xatom.h>
 #include "propertyst.h"
 #include "client.h"
+#include "damage.h"
+#include "dixstruct.h"
 #include "lorie.h"
 
 #define DRM_FORMAT_MOD_LINEAR 0
@@ -397,6 +399,8 @@ static miPointerScreenFuncRec loriePointerCursorFuncs = {
 };
 
 static void loriePerformVblanks(void);
+static void lorieFlushWindowDamage(void);
+static void lorieSetupWmHints(void);
 
 static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     int status, nonEmpty;
@@ -408,7 +412,15 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
 
     pvfb->state->waitForNextFrame = false;
 
-    if (!lorieConnectionAlive() || !pvfb->state->surfaceAvailable)
+    if (!lorieConnectionAlive())
+        return TRUE;
+
+    // Rootless windows are drawn by the app, not by this surface, so their damage goes out whether
+    // or not the root's surface exists: in Floating and Enhanced mode it is often not on screen.
+    lorieSetupWmHints();
+    lorieFlushWindowDamage();
+
+    if (!pvfb->state->surfaceAvailable)
         return TRUE;
 
     nonEmpty = RegionNotEmpty(DamageRegion(pvfb->damage));
@@ -865,21 +877,409 @@ static int32_t lorieWindowPid(WindowPtr pWin) {
     return pid > 0 ? (int32_t) pid : -1;
 }
 
+// The atoms the window manager side reads and writes, made once.
+static struct {
+    Atom motifHints, gtkFrameExtents, netWmState, stateMaxV, stateMaxH, stateFullscreen, stateHidden, stateAbove;
+    Atom moveResize, moveResizeWindow, activeWindow, closeWindow, wmChangeState, wmProtocols, wmDeleteWindow;
+    Atom supported, supportingWmCheck, netWmName, utf8String;
+} lorieAtoms;
+
+static void lorieMakeAtoms(void) {
+    if (lorieAtoms.netWmState)
+        return;
+#define A(name) MakeAtom(name, strlen(name), TRUE)
+    lorieAtoms.motifHints = A("_MOTIF_WM_HINTS");
+    lorieAtoms.gtkFrameExtents = A("_GTK_FRAME_EXTENTS");
+    lorieAtoms.stateMaxV = A("_NET_WM_STATE_MAXIMIZED_VERT");
+    lorieAtoms.stateMaxH = A("_NET_WM_STATE_MAXIMIZED_HORZ");
+    lorieAtoms.stateFullscreen = A("_NET_WM_STATE_FULLSCREEN");
+    lorieAtoms.stateHidden = A("_NET_WM_STATE_HIDDEN");
+    lorieAtoms.stateAbove = A("_NET_WM_STATE_ABOVE");
+    lorieAtoms.moveResize = A("_NET_WM_MOVERESIZE");
+    lorieAtoms.moveResizeWindow = A("_NET_MOVERESIZE_WINDOW");
+    lorieAtoms.activeWindow = A("_NET_ACTIVE_WINDOW");
+    lorieAtoms.closeWindow = A("_NET_CLOSE_WINDOW");
+    lorieAtoms.wmChangeState = A("WM_CHANGE_STATE");
+    lorieAtoms.wmProtocols = A("WM_PROTOCOLS");
+    lorieAtoms.wmDeleteWindow = A("WM_DELETE_WINDOW");
+    lorieAtoms.supported = A("_NET_SUPPORTED");
+    lorieAtoms.supportingWmCheck = A("_NET_SUPPORTING_WM_CHECK");
+    lorieAtoms.netWmName = A("_NET_WM_NAME");
+    lorieAtoms.utf8String = A("UTF8_STRING");
+    lorieAtoms.netWmState = A("_NET_WM_STATE"); // last: it is the "made" marker
+#undef A
+}
+
+// LORIE_STATE_* bits for one _NET_WM_STATE atom, 0 for one the app does not handle.
+static uint32_t lorieStateBit(Atom a) {
+    if (!a) return 0;
+    if (a == lorieAtoms.stateMaxV) return LORIE_STATE_MAXIMIZED_VERT;
+    if (a == lorieAtoms.stateMaxH) return LORIE_STATE_MAXIMIZED_HORZ;
+    if (a == lorieAtoms.stateFullscreen) return LORIE_STATE_FULLSCREEN;
+    if (a == lorieAtoms.stateHidden) return LORIE_STATE_HIDDEN;
+    if (a == lorieAtoms.stateAbove) return LORIE_STATE_ABOVE;
+    return 0;
+}
+
+// What the window says about its frame and state (LORIE_WINDOW_* bits), and the margin a
+// client-decorated window draws around itself (_GTK_FRAME_EXTENTS: left, right, top, bottom).
+//
+// The Enhanced Desktop draws a title bar only for windows that have none of their own. GTK's header
+// bars, Chromium, Electron and libadwaita draw their own and say so with _MOTIF_WM_HINTS (no
+// decorations); GTK adds _GTK_FRAME_EXTENTS, the invisible border it resizes from, which the app
+// must leave out of the window's visible shape.
+static uint8_t lorieWindowFlags(WindowPtr pWin, uint16_t *frame) {
+    PropertyPtr prop;
+    uint8_t flags = 0;
+    frame[0] = frame[1] = frame[2] = frame[3] = 0;
+    lorieMakeAtoms();
+    if (dixLookupProperty(&prop, pWin, lorieAtoms.motifHints, serverClient, DixReadAccess) == Success
+            && prop && prop->format == 32 && prop->size >= 3) {
+        const CARD32 *h = (const CARD32 *) prop->data;
+        if ((h[0] & (1L << 1)) && h[2] == 0) // MWM_HINTS_DECORATIONS, and none of them
+            flags |= LORIE_WINDOW_UNDECORATED;
+    }
+    if (dixLookupProperty(&prop, pWin, lorieAtoms.gtkFrameExtents, serverClient, DixReadAccess) == Success
+            && prop && prop->format == 32 && prop->size >= 4) {
+        const CARD32 *f = (const CARD32 *) prop->data;
+        flags |= LORIE_WINDOW_FRAME_EXTENTS;
+        for (int i = 0; i < 4; i++)
+            frame[i] = f[i] > 1024 ? 1024 : (uint16_t) f[i];
+    }
+    if (dixLookupProperty(&prop, pWin, lorieAtoms.netWmState, serverClient, DixReadAccess) == Success
+            && prop && prop->format == 32 && prop->type == XA_ATOM) {
+        uint32_t bits = 0;
+        for (unsigned long i = 0; i < prop->size; i++)
+            bits |= lorieStateBit(((const CARD32 *) prop->data)[i]);
+        if (bits & LORIE_STATE_FULLSCREEN) flags |= LORIE_WINDOW_FULLSCREEN;
+        if ((bits & LORIE_STATE_MAXIMIZED_VERT) && (bits & LORIE_STATE_MAXIMIZED_HORZ)) flags |= LORIE_WINDOW_MAXIMIZED;
+        if (bits & LORIE_STATE_HIDDEN) flags |= LORIE_WINDOW_HIDDEN;
+    }
+    return flags;
+}
+
 static void lorieReportWindow(WindowPtr pWin, uint8_t mapped) {
     char title[96];
     char wmClass[64];
     uint16_t minW, minH, maxW, maxH;
+    uint16_t frame[4];
     if (!lorieIsTopLevel(pWin))
         return;
     uint64_t buffer = mapped ? lorieWindowBufferId(pWin) : 0;
     lorieWindowTitle(pWin, title, sizeof(title));
     lorieWindowClass(pWin, wmClass, sizeof(wmClass));
     lorieWindowSizeHints(pWin, &minW, &minH, &maxW, &maxH);
+    uint8_t flags = lorieWindowFlags(pWin, frame);
     lorieSendWindowState((uint32_t) pWin->drawable.id, pWin->drawable.x, pWin->drawable.y,
                          pWin->drawable.width, pWin->drawable.height, mapped,
                          pWin->overrideRedirect ? 1 : 0, buffer, title,
                          lorieWindowPid(pWin), wmClass, minW, minH, maxW, maxH,
-                         lorieWindowTransientFor(pWin), lorieWindowKind(pWin));
+                         lorieWindowTransientFor(pWin), lorieWindowKind(pWin), flags, frame);
+}
+
+// --- Breadstick rootless: per-window damage. ---
+//
+// The app used to redraw every Linux window on a 40 ms timer, changed or not, which kept the GPU
+// and the CPU awake for a still desktop. Each mapped top-level window now carries a Damage; the
+// first drawing after a frame marks it, and the frame clock (lorieRedraw, once a vsync) tells the
+// app which windows changed and clears them. So the app hears about a window at most once a frame,
+// and never about one that did not draw.
+#define LORIE_MAX_DAMAGE 256
+static struct {
+    WindowPtr win;
+    DamagePtr damage;
+    volatile uint8_t dirty;
+} lorieDamage[LORIE_MAX_DAMAGE];
+static volatile Bool lorieDamagePending;
+
+static void lorieWindowDamaged(unused DamagePtr pDamage, unused RegionPtr pRegion, void *closure) {
+    intptr_t slot = (intptr_t) closure;
+    if (slot >= 0 && slot < LORIE_MAX_DAMAGE) {
+        lorieDamage[slot].dirty = 1;
+        lorieDamagePending = TRUE;
+    }
+}
+
+// The damage layer destroys a window's Damage itself when the window goes: forget it then, so the
+// slot never points at freed memory.
+static void lorieWindowDamageGone(unused DamagePtr pDamage, void *closure) {
+    intptr_t slot = (intptr_t) closure;
+    if (slot >= 0 && slot < LORIE_MAX_DAMAGE) {
+        lorieDamage[slot].win = NULL;
+        lorieDamage[slot].damage = NULL;
+        lorieDamage[slot].dirty = 0;
+    }
+}
+
+static void lorieTrackDamage(WindowPtr pWin) {
+    int free_slot = -1;
+    for (int i = 0; i < LORIE_MAX_DAMAGE; i++) {
+        if (lorieDamage[i].win == pWin)
+            return;
+        if (free_slot < 0 && !lorieDamage[i].damage)
+            free_slot = i;
+    }
+    if (free_slot < 0) {
+        log(ERROR, "lorieDamage full (%d windows): window 0x%x redraws only when it moves", LORIE_MAX_DAMAGE, (unsigned) pWin->drawable.id);
+        return;
+    }
+    DamagePtr d = DamageCreate(lorieWindowDamaged, lorieWindowDamageGone, DamageReportNonEmpty, FALSE,
+                               pWin->drawable.pScreen, (void *) (intptr_t) free_slot);
+    if (!d)
+        return;
+    lorieDamage[free_slot].win = pWin;
+    lorieDamage[free_slot].damage = d;
+    lorieDamage[free_slot].dirty = 1; // its first frame
+    lorieDamagePending = TRUE;
+    DamageRegister(&pWin->drawable, d);
+}
+
+static void lorieUntrackDamage(WindowPtr pWin) {
+    for (int i = 0; i < LORIE_MAX_DAMAGE; i++) {
+        if (lorieDamage[i].win == pWin && lorieDamage[i].damage) {
+            DamageDestroy(lorieDamage[i].damage); // calls lorieWindowDamageGone, which clears the slot
+            lorieDamage[i].win = NULL;
+            lorieDamage[i].damage = NULL;
+            lorieDamage[i].dirty = 0;
+            return;
+        }
+    }
+}
+
+static void lorieFlushWindowDamage(void) {
+    if (!lorieDamagePending || !lorieRootlessEnabled())
+        return;
+    lorieDamagePending = FALSE;
+    for (int i = 0; i < LORIE_MAX_DAMAGE; i++) {
+        WindowPtr pWin = lorieDamage[i].win;
+        if (!lorieDamage[i].dirty || !pWin || !lorieDamage[i].damage)
+            continue;
+        lorieDamage[i].dirty = 0;
+        DamageEmpty(lorieDamage[i].damage);
+        // As lorieRedraw does for the root: unlocking a CPU-written AHardwareBuffer is what makes
+        // its new contents visible to the GPU on devices whose buffers are not coherent.
+        PixmapPtr pix = pScreenPtr->GetWindowPixmap ? pScreenPtr->GetWindowPixmap(pWin) : NULL;
+        LoriePixmapPriv *priv = pix ? exaGetPixmapDriverPrivate(pix) : NULL;
+        if (priv && priv->buffer && priv->locked && LorieBuffer_description(priv->buffer)->type == LORIEBUFFER_AHARDWAREBUFFER) {
+            LorieBuffer_unlock(priv->buffer);
+            if (LorieBuffer_lock(priv->buffer, &priv->locked))
+                priv->locked = NULL; // loriePrepareAccess locks it again for the next drawing
+        }
+        lorieSendWindowDamage((uint32_t) pWin->drawable.id);
+    }
+}
+
+// --- Breadstick rootless: the window manager's half of EWMH, for the Enhanced Desktop. ---
+//
+// There is no X window manager in Floating or Enhanced mode. In Enhanced mode the app is the window
+// manager (it draws the frames, moves, resizes and stacks), so what clients ask a window manager
+// for goes to it: a GTK header bar dragged, Chromium's maximize button, an app presenting itself.
+// Clients send those as ClientMessages to the root; with nobody selecting SubstructureRedirect
+// there, they reached no one. SendEvent is wrapped to pass them on.
+
+static int lorieWmEnabled(void) {
+    static int v = -1;
+    if (v == -1) v = getenv("BREADSTICK_WM") ? 1 : 0;
+    return v;
+}
+
+static int (*lorieProcSendEventOrig)(ClientPtr);
+
+static WindowPtr lorieTopLevelOf(XID id) {
+    WindowPtr pWin;
+    if (dixLookupWindow(&pWin, id, serverClient, DixGetAttrAccess) != Success || !pWin)
+        return NULL;
+    while (pWin && pWin->parent && !lorieIsTopLevel(pWin))
+        pWin = pWin->parent;
+    return lorieIsTopLevel(pWin) ? pWin : NULL;
+}
+
+static void lorieClientMessage(const xEvent *ev) {
+    lorieMakeAtoms();
+    Atom type = ev->u.clientMessage.u.l.type;
+    const INT32 *l = &ev->u.clientMessage.u.l.longs0;
+    if (type != lorieAtoms.moveResize && type != lorieAtoms.netWmState && type != lorieAtoms.activeWindow
+            && type != lorieAtoms.closeWindow && type != lorieAtoms.wmChangeState && type != lorieAtoms.moveResizeWindow)
+        return;
+    WindowPtr pWin = lorieTopLevelOf(ev->u.clientMessage.window);
+    if (!pWin)
+        return;
+    uint32_t id = (uint32_t) pWin->drawable.id;
+    if (type == lorieAtoms.moveResize) {
+        lorieSendWindowRequest(id, LORIE_REQUEST_MOVERESIZE, l[0], l[1], l[2], l[3]);
+    } else if (type == lorieAtoms.netWmState) {
+        uint32_t bits = lorieStateBit((Atom) l[1]) | lorieStateBit((Atom) l[2]);
+        if (bits)
+            lorieSendWindowRequest(id, LORIE_REQUEST_STATE, l[0], (int32_t) bits, 0, 0);
+    } else if (type == lorieAtoms.activeWindow) {
+        lorieSendWindowRequest(id, LORIE_REQUEST_ACTIVATE, l[0], 0, 0, 0);
+    } else if (type == lorieAtoms.closeWindow) {
+        lorieSendWindowRequest(id, LORIE_REQUEST_CLOSE, 0, 0, 0, 0);
+    } else if (type == lorieAtoms.wmChangeState) {
+        if (l[0] == 3) // IconicState (ICCCM 4.1.4)
+            lorieSendWindowRequest(id, LORIE_REQUEST_ICONIFY, 0, 0, 0, 0);
+    } else if (type == lorieAtoms.moveResizeWindow) {
+        // flags in l[0]: bits 8-11 say which of x, y, width, height are given.
+        int32_t f = l[0];
+        lorieSendWindowRequest(id, LORIE_REQUEST_MOVERESIZE_WINDOW,
+                               (f & (1 << 8)) ? l[1] : -1, (f & (1 << 9)) ? l[2] : -1,
+                               (f & (1 << 10)) ? l[3] : -1, (f & (1 << 11)) ? l[4] : -1);
+    }
+}
+
+static int lorieProcSendEvent(ClientPtr client) {
+    REQUEST(xSendEventReq);
+    if (client->req_len == bytes_to_int32(sizeof(xSendEventReq)) && (stuff->event.u.u.type & 0x7F) == ClientMessage
+            && stuff->event.u.u.detail == 32)
+        lorieClientMessage(&stuff->event);
+    return lorieProcSendEventOrig(client);
+}
+
+// Tell clients a window manager is here, and which of its requests it answers. GTK sends a
+// header-bar drag to the window manager only when _NET_SUPPORTED lists _NET_WM_MOVERESIZE (without
+// one it moves the window itself, which the app then only follows a step behind, and nothing could
+// snap it to an edge). Only in Enhanced mode (BREADSTICK_WM): in Floating mode Android moves the
+// windows and nothing could answer these, and the Classic desktop has xfwm4.
+static void lorieSetupWmHints(void) {
+    static Bool done = FALSE;
+    if (done || !lorieWmEnabled() || !lorieRootlessEnabled() || !pScreenPtr || !pScreenPtr->root)
+        return;
+    done = TRUE;
+    lorieMakeAtoms();
+    int err = Success;
+    XID id = FakeClientID(0);
+    WindowPtr check = CreateWindow(id, pScreenPtr->root, -100, -100, 1, 1, 0, InputOnly, 0, NULL, 0,
+                                   serverClient, CopyFromParent, &err);
+    if (!check || err != Success || !AddResource(id, RT_WINDOW, check)) {
+        log(ERROR, "window manager hints: could not create the check window (%d)", err);
+        return;
+    }
+    CARD32 cid = (CARD32) id;
+    dixChangeWindowProperty(serverClient, check, lorieAtoms.supportingWmCheck, XA_WINDOW, 32, PropModeReplace, 1, &cid, FALSE);
+    dixChangeWindowProperty(serverClient, check, lorieAtoms.netWmName, lorieAtoms.utf8String, 8, PropModeReplace, 10, "Breadstick", FALSE);
+    dixChangeWindowProperty(serverClient, pScreenPtr->root, lorieAtoms.supportingWmCheck, XA_WINDOW, 32, PropModeReplace, 1, &cid, FALSE);
+    CARD32 supported[] = {
+        lorieAtoms.supported, lorieAtoms.supportingWmCheck, lorieAtoms.moveResize, lorieAtoms.moveResizeWindow,
+        lorieAtoms.netWmState, lorieAtoms.stateMaxV, lorieAtoms.stateMaxH, lorieAtoms.stateFullscreen,
+        lorieAtoms.stateHidden, lorieAtoms.activeWindow, lorieAtoms.closeWindow,
+    };
+    dixChangeWindowProperty(serverClient, pScreenPtr->root, lorieAtoms.supported, XA_ATOM, 32, PropModeReplace,
+                            sizeof(supported) / sizeof(supported[0]), supported, FALSE);
+    log(INFO, "window manager hints set (check window 0x%x)", (unsigned) id);
+}
+
+// Write [bits] (LORIE_STATE_*) as the window's _NET_WM_STATE, which the window manager owns: GTK
+// draws its maximize button as "restore" and drops its rounded corners only once it reads it there.
+static void lorieSetWindowState(WindowPtr pWin, uint32_t bits) {
+    CARD32 atoms[5];
+    int n = 0;
+    lorieMakeAtoms();
+    if (bits & LORIE_STATE_MAXIMIZED_VERT) atoms[n++] = lorieAtoms.stateMaxV;
+    if (bits & LORIE_STATE_MAXIMIZED_HORZ) atoms[n++] = lorieAtoms.stateMaxH;
+    if (bits & LORIE_STATE_FULLSCREEN) atoms[n++] = lorieAtoms.stateFullscreen;
+    if (bits & LORIE_STATE_HIDDEN) atoms[n++] = lorieAtoms.stateHidden;
+    if (bits & LORIE_STATE_ABOVE) atoms[n++] = lorieAtoms.stateAbove;
+    dixChangeWindowProperty(serverClient, pWin, lorieAtoms.netWmState, XA_ATOM, 32, PropModeReplace, n, atoms, TRUE);
+}
+
+// Ask the window's program to close it, the way a window manager does: WM_DELETE_WINDOW, when the
+// window lists it in WM_PROTOCOLS. A window that does not take it is left alone (the app's bsl-close
+// decides what to do with those).
+static void lorieAskToClose(WindowPtr pWin) {
+    PropertyPtr prop;
+    ClientPtr owner = wClient(pWin);
+    lorieMakeAtoms();
+    if (!owner || owner == serverClient)
+        return;
+    if (dixLookupProperty(&prop, pWin, lorieAtoms.wmProtocols, serverClient, DixReadAccess) != Success
+            || !prop || prop->format != 32)
+        return;
+    Bool takes = FALSE;
+    for (unsigned long i = 0; i < prop->size; i++)
+        if (((const CARD32 *) prop->data)[i] == lorieAtoms.wmDeleteWindow)
+            takes = TRUE;
+    if (!takes)
+        return;
+    xEvent ev = { .u.u.type = ClientMessage, .u.u.detail = 32 };
+    ev.u.clientMessage.window = pWin->drawable.id;
+    ev.u.clientMessage.u.l.type = lorieAtoms.wmProtocols;
+    ev.u.clientMessage.u.l.longs0 = (INT32) lorieAtoms.wmDeleteWindow;
+    ev.u.clientMessage.u.l.longs1 = (INT32) GetTimeInMillis();
+    WriteEventsToClient(owner, 1, &ev);
+}
+
+// EVENT_WINDOW_COMMAND, run by the main loop (queued by the input thread, which must not touch
+// the window tree). Coordinates are the X screen's; ConfigureWindow keeps the protocol's own rules
+// (a size of 0 is refused), and Composite gives a resized window its new pixmap, which
+// lorieSetWindowPixmap reports.
+Bool lorieWindowCommand(unused ClientPtr pClient, void *closure) {
+    lorieEvent *e = closure;
+    WindowPtr pWin;
+    if (!e)
+        return TRUE;
+    if (!lorieRootlessEnabled() || !pScreenPtr
+            || dixLookupWindow(&pWin, e->windowCommand.window, serverClient, DixManageAccess) != Success
+            || !lorieIsTopLevel(pWin)) {
+        free(e);
+        return TRUE;
+    }
+    int32_t x = e->windowCommand.x, y = e->windowCommand.y;
+    int32_t w = e->windowCommand.w, h = e->windowCommand.h;
+    x = x < -32768 ? -32768 : x > 32767 ? 32767 : x;
+    y = y < -32768 ? -32768 : y > 32767 ? 32767 : y;
+    w = w < 1 ? 1 : w > 32767 ? 32767 : w;
+    h = h < 1 ? 1 : h > 32767 ? 32767 : h;
+    switch (e->windowCommand.op) {
+        case LORIE_COMMAND_MOVE: {
+            XID v[] = { (XID) (CARD32) x, (XID) (CARD32) y };
+            ConfigureWindow(pWin, CWX | CWY, v, serverClient);
+            break;
+        }
+        case LORIE_COMMAND_RESIZE: {
+            XID v[] = { (XID) w, (XID) h };
+            ConfigureWindow(pWin, CWWidth | CWHeight, v, serverClient);
+            break;
+        }
+        case LORIE_COMMAND_MOVE_RESIZE: {
+            XID v[] = { (XID) (CARD32) x, (XID) (CARD32) y, (XID) w, (XID) h };
+            ConfigureWindow(pWin, CWX | CWY | CWWidth | CWHeight, v, serverClient);
+            break;
+        }
+        case LORIE_COMMAND_RAISE: {
+            XID v[] = { Above };
+            ConfigureWindow(pWin, CWStackMode, v, serverClient);
+            break;
+        }
+        case LORIE_COMMAND_LOWER: {
+            XID v[] = { Below };
+            ConfigureWindow(pWin, CWStackMode, v, serverClient);
+            break;
+        }
+        case LORIE_COMMAND_FOCUS: {
+            XID v[] = { Above };
+            ConfigureWindow(pWin, CWStackMode, v, serverClient);
+            // Only a viewable window can have the focus (X refuses the rest with BadMatch).
+            if (pWin->realized) {
+                if (lorieKeyboard)
+                    SetInputFocus(serverClient, lorieKeyboard, pWin->drawable.id, RevertToParent, CurrentTime, FALSE);
+                if (lorieWmEnabled()) {
+                    CARD32 active = (CARD32) pWin->drawable.id;
+                    lorieMakeAtoms();
+                    dixChangeWindowProperty(serverClient, pScreenPtr->root, lorieAtoms.activeWindow, XA_WINDOW, 32,
+                                            PropModeReplace, 1, &active, TRUE);
+                }
+            }
+            break;
+        }
+        case LORIE_COMMAND_CLOSE:
+            lorieAskToClose(pWin);
+            break;
+        case LORIE_COMMAND_SET_STATE:
+            lorieSetWindowState(pWin, (uint32_t) e->windowCommand.x);
+            break;
+    }
+    free(e);
+    return TRUE;
 }
 
 // A mapped top-level window changed a property the app shows or decides by (its title, its class,
@@ -917,8 +1317,10 @@ static void loriePropertyChanged(unused CallbackListPtr *pcbl, unused void *clos
         wmType = MakeAtom("_NET_WM_WINDOW_TYPE", 19, TRUE);
     }
     Atom a = rec->prop->propertyName;
+    lorieMakeAtoms();
     if (a != netWmName && a != XA_WM_NAME && a != XA_WM_CLASS && a != wmType
-            && a != XA_WM_NORMAL_HINTS && a != XA_WM_TRANSIENT_FOR)
+            && a != XA_WM_NORMAL_HINTS && a != XA_WM_TRANSIENT_FOR
+            && a != lorieAtoms.motifHints && a != lorieAtoms.gtkFrameExtents && a != lorieAtoms.netWmState)
         return;
     XID id = rec->win->drawable.id;
     for (int i = 0; i < lorieDirtyCount; i++)
@@ -938,16 +1340,22 @@ static Bool lorieRealizeWindowWrap(WindowPtr pWin) {
     if (lorieIsTopLevel(pWin))
         lorieEnsureRedirect(pWin->drawable.pScreen);
     Bool ret = lorieRealizeWindow ? lorieRealizeWindow(pWin) : TRUE;
+    if (lorieIsTopLevel(pWin))
+        lorieTrackDamage(pWin);
     lorieReportWindow(pWin, 1);
     return ret;
 }
 
 static Bool lorieUnrealizeWindowWrap(WindowPtr pWin) {
+    if (lorieIsTopLevel(pWin))
+        lorieUntrackDamage(pWin);
     lorieReportWindow(pWin, 0);
     return lorieUnrealizeWindow ? lorieUnrealizeWindow(pWin) : TRUE;
 }
 
 static Bool lorieDestroyWindowWrap(WindowPtr pWin) {
+    if (lorieIsTopLevel(pWin))
+        lorieUntrackDamage(pWin);
     lorieReportWindow(pWin, 0);
     return lorieDestroyWindow ? lorieDestroyWindow(pWin) : TRUE;
 }
@@ -1004,6 +1412,12 @@ static Bool lorieScreenInit(ScreenPtr pScreen, unused int argc, unused char **ar
         lorieDestroyWindow = pScreen->DestroyWindow;
         pScreen->DestroyWindow = lorieDestroyWindowWrap;
         AddCallback(&PropertyStateCallback, loriePropertyChanged, NULL);
+        // Once per process: the dispatch table outlives a server reset, and wrapping it twice
+        // would pass every message on twice.
+        if (!lorieProcSendEventOrig) {
+            lorieProcSendEventOrig = ProcVector[X_SendEvent];
+            ProcVector[X_SendEvent] = lorieProcSendEvent;
+        }
     }
 
     ShmRegisterFbFuncs(pScreen);

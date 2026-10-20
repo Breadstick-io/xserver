@@ -400,6 +400,20 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
                 data[e.clipboardSend.count] = 0;
                 QueueWorkProc(handleClipboardData, NULL, data);
                 lorieWakeServer();
+                break;
+            }
+            case EVENT_WINDOW_COMMAND: {
+                // This is the input thread, where the window tree must not be touched: the move, the
+                // raise or the focus is done by the main loop, between requests, as a client's would be.
+                // Before this the app ran xdotool in a proot for each one, two or three processes
+                // against Android's limit for every focus change.
+                lorieEvent *copy = calloc(1, sizeof(lorieEvent));
+                if (copy) {
+                    memcpy(copy, &e, sizeof(e));
+                    QueueWorkProc(lorieWindowCommand, NULL, copy);
+                    lorieWakeServer();
+                }
+                break;
             }
         }
 
@@ -427,16 +441,38 @@ void lorieRequestClipboard(void) {
 
 // Breadstick rootless: tell the activity about a top-level window's geometry / mapped state.
 void lorieSendWindowState(uint32_t window, int16_t x, int16_t y, uint16_t width, uint16_t height, uint8_t mapped, uint8_t popup, uint64_t buffer, const char *title, int32_t pid, const char *wmClass,
-                          uint16_t minW, uint16_t minH, uint16_t maxW, uint16_t maxH, uint32_t transientFor, uint8_t kind) {
+                          uint16_t minW, uint16_t minH, uint16_t maxW, uint16_t maxH, uint32_t transientFor, uint8_t kind,
+                          uint8_t flags, const uint16_t *frame) {
     if (conn_fd != -1) {
         lorieEvent e = { .windowState = { .t = EVENT_WINDOW_STATE, .window = window,
                                           .x = x, .y = y, .width = width, .height = height, .mapped = mapped, .popup = popup, .buffer = buffer,
                                           .pid = pid, .minW = minW, .minH = minH, .maxW = maxW, .maxH = maxH,
-                                          .transientFor = transientFor, .kind = kind } };
+                                          .transientFor = transientFor, .kind = kind, .flags = flags } };
+        if (frame)
+            memcpy(e.windowState.frame, frame, sizeof(e.windowState.frame));
         if (title)
             strncpy(e.windowState.title, title, sizeof(e.windowState.title) - 1);
         if (wmClass)
             strncpy(e.windowState.wmClass, wmClass, sizeof(e.windowState.wmClass) - 1);
+        write(conn_fd, &e, sizeof(e));
+    }
+}
+
+// Breadstick rootless: window [window] drew something since the last frame. Sent from the frame
+// clock, once a frame at most, so the app redraws a window only when it changed.
+void lorieSendWindowDamage(uint32_t window) {
+    if (conn_fd != -1) {
+        lorieEvent e = { .windowDamage = { .t = EVENT_WINDOW_DAMAGE, .window = window } };
+        write(conn_fd, &e, sizeof(e));
+    }
+}
+
+// Breadstick rootless: a client asked the window manager for something (LORIE_REQUEST_*). There is
+// no X window manager here; the app is the window manager, so the request goes to it.
+void lorieSendWindowRequest(uint32_t window, uint8_t request, int32_t a, int32_t b, int32_t c, int32_t d) {
+    if (conn_fd != -1) {
+        lorieEvent e = { .windowRequest = { .t = EVENT_WINDOW_REQUEST, .request = request, .window = window,
+                                            .a = a, .b = b, .c = c, .d = d } };
         write(conn_fd, &e, sizeof(e));
     }
 }

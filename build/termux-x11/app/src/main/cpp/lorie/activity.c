@@ -271,7 +271,7 @@ static int xcallback(int fd, int events, __unused void* data) {
                 }
                 case EVENT_WINDOW_STATE: {
                     // Geometry / mapped state — drives the live window list.
-                    jmethodID ms = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, thiz), "onWindowState", "(IIIIIZZLjava/lang/String;ILjava/lang/String;IIIIII)V");
+                    jmethodID ms = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, thiz), "onWindowState", "(IIIIIZZLjava/lang/String;ILjava/lang/String;IIIIIIIIIII)V");
                     if (ms) {
                         e.windowState.title[sizeof(e.windowState.title) - 1] = 0;
                         e.windowState.wmClass[sizeof(e.windowState.wmClass) - 1] = 0;
@@ -286,7 +286,10 @@ static int xcallback(int fd, int events, __unused void* data) {
                                                (jint) e.windowState.pid, wmClass,
                                                (jint) e.windowState.minW, (jint) e.windowState.minH,
                                                (jint) e.windowState.maxW, (jint) e.windowState.maxH,
-                                               (jint) e.windowState.transientFor, (jint) e.windowState.kind);
+                                               (jint) e.windowState.transientFor, (jint) e.windowState.kind,
+                                               (jint) e.windowState.flags,
+                                               (jint) e.windowState.frame[0], (jint) e.windowState.frame[1],
+                                               (jint) e.windowState.frame[2], (jint) e.windowState.frame[3]);
                         (*env)->DeleteLocalRef(env, title);
                         (*env)->DeleteLocalRef(env, wmClass);
                     }
@@ -306,6 +309,23 @@ static int xcallback(int fd, int events, __unused void* data) {
                             }
                         }
                     }
+                    break;
+                }
+                case EVENT_WINDOW_DAMAGE: {
+                    // Once a frame at most per window: the method id is looked up once.
+                    static jmethodID md = NULL;
+                    if (!md)
+                        md = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, thiz), "onWindowDamage", "(I)V");
+                    if (md)
+                        (*env)->CallVoidMethod(env, thiz, md, (jint) e.windowDamage.window);
+                    break;
+                }
+                case EVENT_WINDOW_REQUEST: {
+                    jmethodID mr = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, thiz), "onWindowRequest", "(IIIIII)V");
+                    if (mr)
+                        (*env)->CallVoidMethod(env, thiz, mr, (jint) e.windowRequest.window, (jint) e.windowRequest.request,
+                                               (jint) e.windowRequest.a, (jint) e.windowRequest.b,
+                                               (jint) e.windowRequest.c, (jint) e.windowRequest.d);
                     break;
                 }
             }
@@ -474,6 +494,22 @@ static void sendTextEvent(JNIEnv *env, __unused jobject thiz, jbyteArray text) {
     }
 }
 
+// Breadstick rootless: move, resize, raise, focus, close or set the state of top-level window
+// [window] (LORIE_COMMAND_*). The server's input thread hands it to the main loop.
+static void sendWindowCommand(__unused JNIEnv *env, __unused jclass clazz, jint op, jint window, jint x, jint y, jint w, jint h) {
+    if (conn_fd != -1) {
+        lorieEvent e = { .windowCommand = { .t = EVENT_WINDOW_COMMAND, .op = (uint8_t) op, .window = (uint32_t) window,
+                                            .x = x, .y = y, .w = w, .h = h } };
+        write(conn_fd, &e, sizeof(e));
+    }
+}
+
+// What this library adds to the rootless protocol, for the app to check before relying on it:
+// 1 = window damage, window-manager requests, window commands, frame flags (app 3.0).
+static jint windowProtocol(__unused JNIEnv *env, __unused jclass clazz) {
+    return 1;
+}
+
 JNIEXPORT jint JNI_OnLoad(JavaVM *vm, __unused void *reserved) {
     JNIEnv* env;
     static JNINativeMethod methods[] = {
@@ -496,6 +532,8 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, __unused void *reserved) {
             {"sendKeyEvent", "(IIZI)Z", (void *)&sendKeyEvent},
             {"sendTextEvent", "([B)V", (void *)&sendTextEvent},
             {"requestConnection", "()Z", (void *)&requestConnection},
+            {"sendWindowCommand", "(IIIIII)V", (void *)&sendWindowCommand},
+            {"windowProtocol", "()I", (void *)&windowProtocol},
     };
     (*vm)->AttachCurrentThread(vm, &env, NULL);
     jclass cls = (*env)->FindClass(env, "io/breadstick/x11/LorieView");
