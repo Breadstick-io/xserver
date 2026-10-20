@@ -582,11 +582,29 @@ void lorieUnregisterBuffer(LorieBuffer* buffer) {
     }
 }
 
-void DDXNotifyFocusChanged(void) {
-    if (conn_fd != -1) {
-        lorieEvent e = { .type = EVENT_WINDOW_FOCUS_CHANGED };
-        write(conn_fd, &e, sizeof(e));
+/*
+ * The keyboard focus moved: tell the app which top-level window has it now, whoever moved it. The
+ * app keeps the window it last focused so a press on an open menu does not raise its parent over it;
+ * a program that takes the focus itself (Steam's web helper does) left that stale, and pressing the
+ * window the app thought was focused did nothing: no typing into a Floating terminal while Steam ran
+ * (XPS Googlebook, 2026-10-20).
+ */
+void DDXNotifyFocusChanged(DeviceIntPtr pDev, WindowPtr to) {
+    if (conn_fd == -1)
+        return;
+    lorieEvent e = { .focusChanged = { .t = EVENT_WINDOW_FOCUS_CHANGED } };
+    if (pDev && IsKeyboardDevice(pDev)) {
+        e.focusChanged.known = 1;
+        // None, PointerRoot and FollowKeyboard are small constants, not windows.
+        if ((uintptr_t) to > 3) {
+            WindowPtr w = to;
+            while (w->parent && w->parent->parent)
+                w = w->parent;
+            if (w->parent)
+                e.focusChanged.window = (uint32_t) w->drawable.id;
+        }
     }
+    write(conn_fd, &e, sizeof(e));
 }
 
 JNIEXPORT jobject JNICALL

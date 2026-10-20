@@ -267,6 +267,16 @@ static int xcallback(int fd, int events, __unused void* data) {
                 }
                 case EVENT_WINDOW_FOCUS_CHANGED: {
                     (*env)->CallVoidMethod(env, thiz, MainActivity.resetIme);
+                    if (e.focusChanged.known) {
+                        // An app without the callback (older Java side) just does not hear it.
+                        static jmethodID mf = NULL;
+                        if (!mf) {
+                            mf = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, thiz), "onFocusChanged", "(I)V");
+                            if (!mf) (*env)->ExceptionClear(env);
+                        }
+                        if (mf)
+                            (*env)->CallVoidMethod(env, thiz, mf, (jint) e.focusChanged.window);
+                    }
                     break;
                 }
                 case EVENT_WINDOW_STATE: {

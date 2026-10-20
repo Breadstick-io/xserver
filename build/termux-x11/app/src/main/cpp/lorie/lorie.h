@@ -223,6 +223,11 @@ typedef union {
     } windowDamage;
     struct {
         uint8_t t;
+        uint8_t known;         // 1 when [window] is the keyboard focus's top-level window (0 = none)
+        uint32_t window;
+    } focusChanged;
+    struct {
+        uint8_t t;
         uint8_t request;       // LORIE_REQUEST_*
         uint32_t window;
         int32_t a, b, c, d;
