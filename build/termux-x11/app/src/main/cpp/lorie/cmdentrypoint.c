@@ -623,6 +623,22 @@ void lorieUnregisterBuffer(LorieBuffer* buffer) {
  * window the app thought was focused did nothing: no typing into a Floating terminal while Steam ran
  * (XPS Googlebook, 2026-10-20).
  */
+/*
+ * A pointer grab started or stopped confining the pointer to a window (Wine does it for a game's
+ * ClipCursor). The app answers with Android pointer capture: while confined, the focused window takes
+ * the mouse or touchpad as relative motion, which is what a game reading DirectInput expects;
+ * absolute positions fought Wine re-centering the pointer and the cursor went all over the place
+ * (Fable, XPS Googlebook, 2026-10-20).
+ */
+void DDXNotifyPointerConfine(DeviceIntPtr mouse, Bool confined) {
+    static int last = -1;
+    if (conn_fd == -1 || (int) confined == last)
+        return;
+    last = confined ? 1 : 0;
+    lorieEvent e = { .pointerConfine = { .t = EVENT_POINTER_CONFINE, .confined = confined ? 1 : 0 } };
+    write(conn_fd, &e, sizeof(e));
+}
+
 void DDXNotifyFocusChanged(DeviceIntPtr pDev, WindowPtr to) {
     if (conn_fd == -1)
         return;

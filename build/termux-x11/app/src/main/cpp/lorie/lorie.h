@@ -118,6 +118,7 @@ typedef enum {
     EVENT_WINDOW_DAMAGE, // Breadstick rootless: a top-level window's pixels changed (at most once a frame)
     EVENT_WINDOW_REQUEST, // Breadstick rootless: a client asked the window manager for something (move, state, ...)
     EVENT_WINDOW_COMMAND, // Breadstick rootless, app to server: move, resize, raise, focus, close, set state
+    EVENT_POINTER_CONFINE, // Breadstick: a pointer grab confines the pointer (a game's ClipCursor), or no longer
 } eventType;
 
 // EVENT_WINDOW_STATE flags: what the window says about its own frame and state.
@@ -238,6 +239,10 @@ typedef union {
         uint32_t window;
         int32_t x, y, w, h;
     } windowCommand;
+    struct {
+        uint8_t t;
+        uint8_t confined;      // 1 while a pointer grab confines the pointer to a window
+    } pointerConfine;
 } lorieEvent;
 
 struct lorie_shared_server_state {

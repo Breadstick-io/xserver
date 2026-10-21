@@ -1608,6 +1608,9 @@ UpdateGesturesForGrab(DeviceIntPtr mouse)
  * @param autoGrab True if the grab was caused by a button down event and not
  * explicitly by a client.
  */
+/* Breadstick (lorie/cmdentrypoint.c): the app captures the Android pointer while a grab confines it. */
+extern void DDXNotifyPointerConfine(DeviceIntPtr mouse, Bool confined);
+
 void
 ActivatePointerGrab(DeviceIntPtr mouse, GrabPtr grab,
                     TimeStamp time, Bool autoGrab)
@@ -1646,6 +1649,8 @@ ActivatePointerGrab(DeviceIntPtr mouse, GrabPtr grab,
     UpdateGesturesForGrab(mouse);
     CheckGrabForSyncs(mouse, (Bool) grab->pointerMode,
                       (Bool) grab->keyboardMode);
+    if (grab->confineTo || (oldgrab && oldgrab->confineTo))
+        DDXNotifyPointerConfine(mouse, grab->confineTo != NULL);
     if (oldgrab)
         FreeGrab(oldgrab);
 }
@@ -1664,6 +1669,7 @@ DeactivatePointerGrab(DeviceIntPtr mouse)
     Bool wasImplicit = (mouse->deviceGrab.fromPassiveGrab &&
                         mouse->deviceGrab.implicitGrab);
     XID grab_resource = grab->resource;
+    Bool wasConfined = grab->confineTo != NULL;
     int i;
 
     /* If an explicit grab was deactivated, we must remove it from the head of
@@ -1721,6 +1727,8 @@ DeactivatePointerGrab(DeviceIntPtr mouse)
     ComputeFreezes();
 
     FreeGrab(grab);
+    if (wasConfined)
+        DDXNotifyPointerConfine(mouse, FALSE);
 }
 
 /**

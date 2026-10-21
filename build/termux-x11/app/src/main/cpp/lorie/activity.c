@@ -321,6 +321,16 @@ static int xcallback(int fd, int events, __unused void* data) {
                     }
                     break;
                 }
+                case EVENT_POINTER_CONFINE: {
+                    static jmethodID mc = NULL;
+                    if (!mc) {
+                        mc = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, thiz), "onPointerConfine", "(Z)V");
+                        if (!mc) (*env)->ExceptionClear(env);
+                    }
+                    if (mc)
+                        (*env)->CallVoidMethod(env, thiz, mc, (jboolean) (e.pointerConfine.confined != 0));
+                    break;
+                }
                 case EVENT_WINDOW_DAMAGE: {
                     // Once a frame at most per window: the method id is looked up once.
                     static jmethodID md = NULL;
