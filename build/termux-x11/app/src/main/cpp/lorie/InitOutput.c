@@ -970,6 +970,11 @@ static void lorieReportWindow(WindowPtr pWin, uint8_t mapped) {
     uint16_t frame[4];
     if (!lorieIsTopLevel(pWin))
         return;
+    // An InputOnly window has no pixels: it only catches or confines the pointer (Wine makes one
+    // the size of the game for ClipCursor). Reported, the app filled it with its own background,
+    // a white box over Fable and Steam (XPS Googlebook, 2026-10-20).
+    if (pWin->drawable.class == InputOnly)
+        return;
     uint64_t buffer = mapped ? lorieWindowBufferId(pWin) : 0;
     lorieWindowTitle(pWin, title, sizeof(title));
     lorieWindowClass(pWin, wmClass, sizeof(wmClass));
