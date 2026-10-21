@@ -1266,8 +1266,12 @@ Bool lorieWindowCommand(unused ClientPtr pClient, void *closure) {
             ConfigureWindow(pWin, CWStackMode, v, serverClient);
             // Only a viewable window can have the focus (X refuses the rest with BadMatch).
             if (pWin->realized) {
-                if (lorieKeyboard)
-                    SetInputFocus(serverClient, lorieKeyboard, pWin->drawable.id, RevertToParent, CurrentTime, FALSE);
+                // The MASTER keyboard's focus: lorieKeyboard is a slave attached to it, and a slave's
+                // own focus is invisible to programs (XGetInputFocus and the core FocusIn they act on
+                // report the master's). Focusing the slave left Steam's web helper focused under a
+                // clicked Fable, and Wine dropped every click (XPS Googlebook, 2026-10-20).
+                if (inputInfo.keyboard)
+                    SetInputFocus(serverClient, inputInfo.keyboard, pWin->drawable.id, RevertToParent, CurrentTime, FALSE);
                 if (lorieWmEnabled()) {
                     CARD32 active = (CARD32) pWin->drawable.id;
                     lorieMakeAtoms();
