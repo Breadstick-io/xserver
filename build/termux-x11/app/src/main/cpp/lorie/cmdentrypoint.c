@@ -24,6 +24,8 @@
 #include <arpa/inet.h>
 #include <poll.h>
 #include "lorie.h"
+#include <eventstr.h>
+#include <mi.h>
 
 #define log(prio, ...) __android_log_print(ANDROID_LOG_ ## prio, "LorieNative", __VA_ARGS__)
 
@@ -290,6 +292,36 @@ static Bool lorieDeferredInput(__unused ClientPtr pClient, void *closure) {
     free(ev);
     return TRUE;
 }
+/*
+ * Android hands Breadstick absolute pointer positions, which go into X with POINTER_NORAW: an absolute
+ * position read as a raw (relative-device) value would be a jump of thousands of pixels. But programs
+ * that read the mouse as motion read ONLY raw events (XI2 RawMotion): Wine's DirectInput and raw
+ * input, SDL's relative mode, Chromium's pointer lock. Fable's cursor never moved (XPS Googlebook,
+ * 2026-10-20). So each absolute move also queues a raw motion carrying how far it moved.
+ */
+static void lorieQueueRawDelta(DeviceIntPtr dev, double x, double y) {
+    static double lastX, lastY;
+    static Bool haveLast;
+    double dx = x - lastX, dy = y - lastY;
+    Bool had = haveLast;
+    lastX = x; lastY = y; haveLast = TRUE;
+    if (!had || (dx == 0 && dy == 0) || !dev)
+        return;
+    InternalEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.raw_event.header = ET_Internal;
+    ev.raw_event.length = sizeof(RawDeviceEvent);
+    ev.raw_event.type = ET_RawMotion;
+    ev.raw_event.time = GetTimeInMillis();
+    ev.raw_event.deviceid = dev->id;
+    ev.raw_event.sourceid = dev->id;
+    SetBit(ev.raw_event.valuators.mask, 0);
+    SetBit(ev.raw_event.valuators.mask, 1);
+    ev.raw_event.valuators.data[0] = ev.raw_event.valuators.data_raw[0] = dx;
+    ev.raw_event.valuators.data[1] = ev.raw_event.valuators.data_raw[1] = dy;
+    mieqEnqueue(dev, &ev);
+}
+
 
 void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
     lorieEvent e = {0};
@@ -441,6 +473,8 @@ static void lorieApplyInputEvent(lorieEvent *ev) {
                         valuator_mask_set_double(&mask, 0, (double) ev->mouse.x);
                         valuator_mask_set_double(&mask, 1, (double) ev->mouse.y);
                         QueuePointerEvents(lorieMouse, MotionNotify, 0, flags, &mask);
+                        if (!ev->mouse.relative)
+                            lorieQueueRawDelta(lorieMouse, ev->mouse.x, ev->mouse.y);
                         break;
                     case 1: // BUTTON_LEFT
                     case 2: // BUTTON_MIDDLE
