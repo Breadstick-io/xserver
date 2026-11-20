@@ -555,6 +555,16 @@ void lorieSendWindowDamage(uint32_t window) {
     }
 }
 
+// Breadstick rootless: window [window] shows buffer [buffer] now (a Present flip made another
+// pixmap the window's). Geometry as in the last EVENT_WINDOW_STATE; sent from the frame clock.
+void lorieSendWindowBuffer(uint32_t window, uint64_t buffer, int16_t x, int16_t y, uint16_t width, uint16_t height) {
+    if (conn_fd != -1) {
+        lorieEvent e = { .windowBuffer = { .t = EVENT_WINDOW_BUFFER, .window = window, .x = x, .y = y,
+                                           .width = width, .height = height, .buffer = buffer } };
+        write(conn_fd, &e, sizeof(e));
+    }
+}
+
 // Breadstick rootless: a client asked the window manager for something (LORIE_REQUEST_*). There is
 // no X window manager here; the app is the window manager, so the request goes to it.
 void lorieSendWindowRequest(uint32_t window, uint8_t request, int32_t a, int32_t b, int32_t c, int32_t d) {

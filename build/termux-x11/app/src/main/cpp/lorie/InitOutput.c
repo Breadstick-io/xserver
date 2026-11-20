@@ -495,6 +495,8 @@ static Bool lorieCloseScreen(ScreenPtr pScreen) {
 static int lorieRootlessEnabled(void);
 static Bool lorieIsTopLevel(WindowPtr pWin);
 static void lorieReportWindow(WindowPtr pWin, uint8_t mapped);
+static Bool lorieFlipInProgress;
+static void lorieFlipLeft(WindowPtr pWin);
 
 void lorieSetWindowPixmap(WindowPtr pWindow, PixmapPtr newPixmap) {
     bool isRoot = pWindow == pScreenPtr->root;
@@ -522,8 +524,12 @@ void lorieSetWindowPixmap(WindowPtr pWindow, PixmapPtr newPixmap) {
     // Breadstick rootless: a top-level window's backing pixmap just changed — typically because
     // it was resized (Composite reallocated it). Re-export the new buffer + geometry so the
     // host (Android) window redraws at the new size instead of stretching a stale buffer.
-    if (!isRoot && lorieRootlessEnabled() && pWindow->realized && lorieIsTopLevel(pWindow))
+    if (!isRoot && lorieRootlessEnabled() && pWindow->realized && lorieIsTopLevel(pWindow)) {
+        if (lorieFlipInProgress)
+            return; // a Present flip: the frame clock tells the app, once a frame at most
+        lorieFlipLeft(pWindow); // Composite replaced a presented pixmap (a resize)
         lorieReportWindow(pWindow, 1);
+    }
 }
 
 static int lorieSetPixmapVisitWindow(WindowPtr window, void *data) {
@@ -999,6 +1005,12 @@ static struct {
     WindowPtr win;
     DamagePtr damage;
     volatile uint8_t dirty;
+    // Present flips (below): the presented pixmap that is the window's pixmap now, its Present
+    // serial, whether the app has been told about it, and whether it still has to be.
+    PixmapPtr flipPix;
+    CARD32 flipSerial;
+    uint8_t flipAnnounced;
+    uint8_t flipDirty;
 } lorieDamage[LORIE_MAX_DAMAGE];
 static volatile Bool lorieDamagePending;
 
@@ -1018,6 +1030,8 @@ static void lorieWindowDamageGone(unused DamagePtr pDamage, void *closure) {
         lorieDamage[slot].win = NULL;
         lorieDamage[slot].damage = NULL;
         lorieDamage[slot].dirty = 0;
+        lorieDamage[slot].flipPix = NULL;
+        lorieDamage[slot].flipAnnounced = lorieDamage[slot].flipDirty = 0;
     }
 }
 
@@ -1047,6 +1061,7 @@ static void lorieTrackDamage(WindowPtr pWin) {
 static void lorieUntrackDamage(WindowPtr pWin) {
     for (int i = 0; i < LORIE_MAX_DAMAGE; i++) {
         if (lorieDamage[i].win == pWin && lorieDamage[i].damage) {
+            lorieFlipLeft(pWin);
             DamageDestroy(lorieDamage[i].damage); // calls lorieWindowDamageGone, which clears the slot
             lorieDamage[i].win = NULL;
             lorieDamage[i].damage = NULL;
@@ -1056,12 +1071,182 @@ static void lorieUntrackDamage(WindowPtr pWin) {
     }
 }
 
+// --- Breadstick rootless: Present flips for a top-level window (gpu A2-DESIGN.md). ---
+//
+// A program that presents a whole-window pixmap backed by an AHardwareBuffer (DRI3 modifier 1255:
+// the GPU server drew into it) used to have it copied into the window's own pixmap on the CPU,
+// 3 ms a 1080p frame. Here the presented pixmap BECOMES the window's pixmap, the way Present flips
+// a full-screen window onto the screen: Composite owns one reference to whatever the window's
+// pixmap is, so the reference moves from the old pixmap to the new one and nothing is copied.
+//
+// The app hears about the window's buffer from the frame clock, once a frame at most
+// (lorieFlushWindowDamage). A presented pixmap the app was shown stays held until the app has had
+// two frames with its successor, and only then goes idle (PresentIdleNotify), so the program never
+// draws into a buffer Android may still be reading: no tearing. One the app never saw goes idle
+// the moment it is replaced.
+#define LORIE_FLIP_HOLD_FRAMES 2
+#define LORIE_MAX_HELD 64
+static struct {
+    PixmapPtr pix;        // one reference held
+    XID window;
+    CARD32 serial;
+    uint64_t release_msc; // 0 = its successor has not been shown to the app yet
+} lorieHeld[LORIE_MAX_HELD];
+static int lorieHeldCount;
+
+struct present_fence;
+extern void present_pixmap_idle(PixmapPtr pixmap, WindowPtr window, CARD32 serial, struct present_fence *present_fence);
+
+static void lorieFlipIdle(PixmapPtr pix, XID window, CARD32 serial) {
+    WindowPtr w = NULL;
+    if (dixLookupWindow(&w, window, serverClient, DixGetAttrAccess) != Success)
+        w = NULL;
+    if (w)
+        present_pixmap_idle(pix, w, serial, NULL);
+}
+
+// The pixmap stops being the window's: idle now, or held if the app was shown it. Takes no
+// reference away from the caller; a held pixmap gets one of its own.
+static void lorieFlipRetire(PixmapPtr pix, XID window, CARD32 serial, Bool announced, Bool windowGoes) {
+    if (announced && !windowGoes && lorieHeldCount < LORIE_MAX_HELD) {
+        pix->refcnt++;
+        lorieHeld[lorieHeldCount].pix = pix;
+        lorieHeld[lorieHeldCount].window = window;
+        lorieHeld[lorieHeldCount].serial = serial;
+        lorieHeld[lorieHeldCount].release_msc = 0;
+        lorieHeldCount++;
+        return;
+    }
+    if (!windowGoes)
+        lorieFlipIdle(pix, window, serial);
+}
+
+static void lorieFlipSuccessorAnnounced(XID window) {
+    for (int i = 0; i < lorieHeldCount; i++)
+        if (lorieHeld[i].window == window && !lorieHeld[i].release_msc)
+            lorieHeld[i].release_msc = pvfb->current_msc + LORIE_FLIP_HOLD_FRAMES;
+}
+
+static void lorieFlipReleaseHeld(Bool all) {
+    for (int i = 0; i < lorieHeldCount;) {
+        if (all || (lorieHeld[i].release_msc && lorieHeld[i].release_msc <= pvfb->current_msc)) {
+            PixmapPtr pix = lorieHeld[i].pix;
+            lorieFlipIdle(pix, lorieHeld[i].window, lorieHeld[i].serial);
+            lorieHeld[i] = lorieHeld[--lorieHeldCount];
+            dixDestroyPixmap(pix, 0);
+        } else
+            i++;
+    }
+}
+
+// The window's pixmap is no longer the presented one (Composite made a new one for a resize, or
+// the window is going): the presented pixmap goes back to its owner.
+static void lorieFlipLeft(WindowPtr pWin) {
+    for (int i = 0; i < LORIE_MAX_DAMAGE; i++) {
+        if (lorieDamage[i].win != pWin || !lorieDamage[i].flipPix)
+            continue;
+        PixmapPtr pix = lorieDamage[i].flipPix;
+        Bool announced = lorieDamage[i].flipAnnounced;
+        lorieDamage[i].flipPix = NULL;
+        lorieDamage[i].flipAnnounced = lorieDamage[i].flipDirty = 0;
+        // Composite still frees its reference after this returns; what is held keeps its own.
+        lorieFlipRetire(pix, (XID) pWin->drawable.id, lorieDamage[i].flipSerial, announced, FALSE);
+        // Whatever was waiting for this window's next frame waits for one more announcement:
+        // the resized window's own pixmap is reported by lorieReportWindow right after this.
+        lorieFlipSuccessorAnnounced((XID) pWin->drawable.id);
+        return;
+    }
+}
+
+// Called by Present in place of its copy (xserver/present/present_execute.c). TRUE: the pixmap is
+// the window's now, and its idle notification is ours to send.
+Bool lorieWindowFlip(WindowPtr pWin, PixmapPtr pixmap, RegionPtr update, int16_t x_off, int16_t y_off,
+                     CARD32 serial, Bool has_idle_fence) {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char *e = getenv("BREADSTICK_PRESENT_FLIP"); // "0" turns it off (the copy stays)
+        enabled = !(e && e[0] == '0');
+    }
+    if (!enabled || !lorieRootlessEnabled() || !pWin || !pixmap || has_idle_fence || update || x_off || y_off)
+        return FALSE;
+    if (!lorieIsTopLevel(pWin) || !pWin->realized || pWin->drawable.class != InputOutput || pWin->firstChild
+        || pWin->borderWidth)
+        return FALSE;
+
+    ScreenPtr s = pWin->drawable.pScreen;
+    PixmapPtr old = s->GetWindowPixmap(pWin);
+    if (!old || old == pixmap || old == s->GetScreenPixmap(s))
+        return FALSE; // not redirected, or the same pixmap presented twice
+    if (pixmap->drawable.depth != pWin->drawable.depth || pixmap->drawable.bitsPerPixel != old->drawable.bitsPerPixel
+        || pixmap->drawable.width != old->drawable.width || pixmap->drawable.height != old->drawable.height
+        || pixmap->drawable.width != pWin->drawable.width || pixmap->drawable.height != pWin->drawable.height)
+        return FALSE;
+
+    LoriePixmapPriv *priv = exaGetPixmapDriverPrivate(pixmap);
+    if (!priv || !priv->buffer || !priv->imported || priv->mem || priv->flipped
+        || LorieBuffer_description(priv->buffer)->type != LORIEBUFFER_AHARDWAREBUFFER)
+        return FALSE;
+
+    int slot = -1;
+    for (int i = 0; i < LORIE_MAX_DAMAGE; i++)
+        if (lorieDamage[i].win == pWin && lorieDamage[i].damage) { slot = i; break; }
+    if (slot < 0)
+        return FALSE;
+
+    // An imported buffer is never kept locked for the CPU: the GPU server draws into it.
+    if (priv->locked) {
+        LorieBuffer_unlock(priv->buffer);
+        priv->locked = NULL;
+        priv->wasLocked = FALSE;
+    }
+
+    pixmap->refcnt++; // the window's reference, which Composite frees with the window or at a resize
+#ifdef COMPOSITE
+    pixmap->screen_x = old->screen_x;
+    pixmap->screen_y = old->screen_y;
+#endif
+    lorieFlipInProgress = TRUE;
+    s->SetWindowPixmap(pWin, pixmap);
+    lorieFlipInProgress = FALSE;
+
+    if (lorieDamage[slot].flipPix == old)
+        lorieFlipRetire(old, (XID) pWin->drawable.id, lorieDamage[slot].flipSerial, lorieDamage[slot].flipAnnounced, FALSE);
+    dixDestroyPixmap(old, 0); // the window's reference to the old one (Composite's own pixmap the first time)
+
+    lorieDamage[slot].flipPix = pixmap;
+    lorieDamage[slot].flipSerial = serial;
+    lorieDamage[slot].flipAnnounced = 0;
+    lorieDamage[slot].flipDirty = 1;
+    lorieDamagePending = TRUE;
+    return TRUE;
+}
+
 static void lorieFlushWindowDamage(void) {
+    lorieFlipReleaseHeld(FALSE);
     if (!lorieDamagePending || !lorieRootlessEnabled())
         return;
     lorieDamagePending = FALSE;
     for (int i = 0; i < LORIE_MAX_DAMAGE; i++) {
         WindowPtr pWin = lorieDamage[i].win;
+        if (pWin && lorieDamage[i].flipDirty) {
+            // The newest presented buffer of this frame becomes what the app shows. Frames
+            // presented and replaced since the last tick were never shown to it.
+            lorieDamage[i].flipDirty = 0;
+            if (lorieDamage[i].flipPix && pScreenPtr->GetWindowPixmap(pWin) == lorieDamage[i].flipPix) {
+                uint64_t buffer = lorieWindowBufferId(pWin);
+                if (buffer) {
+                    lorieSendWindowBuffer((uint32_t) pWin->drawable.id, buffer, pWin->drawable.x, pWin->drawable.y,
+                                          pWin->drawable.width, pWin->drawable.height);
+                    lorieDamage[i].flipAnnounced = 1;
+                    lorieFlipSuccessorAnnounced((XID) pWin->drawable.id);
+                }
+                lorieDamage[i].dirty = 0;
+                if (lorieDamage[i].damage)
+                    DamageEmpty(lorieDamage[i].damage);
+                lorieSendWindowDamage((uint32_t) pWin->drawable.id);
+                continue;
+            }
+        }
         if (!lorieDamage[i].dirty || !pWin || !lorieDamage[i].damage)
             continue;
         lorieDamage[i].dirty = 0;
