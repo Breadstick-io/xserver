@@ -13,6 +13,9 @@
 #endif
 
 #include <sys/eventfd.h>
+#include <sys/socket.h>
+#include <poll.h>
+#include <fcntl.h>
 #include <sys/errno.h>
 #include <libxcvt/libxcvt.h>
 #include <X11/X.h>
@@ -105,6 +108,9 @@ typedef struct {
     bool flipped, wasLocked, imported;
     void *locked;
     void *mem;
+    // Breadstick (gpu A2-DESIGN.md 6a): our end of the socket the buffer came through, plus 1
+    // (0 = none). The GPU server sends each frame's fence down it; see lorieFrameNotReady.
+    int fenceSock;
 } LoriePixmapPriv;
 
 #define LORIE_PIXMAP_PRIV_FROM_PIXMAP(pixmap) (pixmap ? ((LoriePixmapPriv*) exaGetPixmapDriverPrivate(pixmap)) : NULL)
@@ -1818,8 +1824,110 @@ void *lorieCreatePixmap(__unused ScreenPtr pScreen, int width, int height, __unu
     return priv;
 }
 
+// --- Breadstick: a frame is shown when the GPU has finished it (gpu A2-DESIGN.md, 6a). ---
+//
+// The GPU server draws a program's frame into a buffer this server holds as a pixmap, and does not
+// wait for the GPU: it sends the GPU's fence for the frame (a kernel sync file) down the buffer's
+// own socket and answers the program at once. The program then presents the pixmap. Present asks
+// here before it shows a pixmap (xserver/present/present_execute.c): if the newest fence in the
+// socket has not signaled, the main loop watches it and Present runs the frame when it has. So
+// nothing is shown, and nothing is copied out of the buffer, before the GPU is done with it, and
+// neither the program nor the GPU server ever waits.
+#define LORIE_MAX_FRAME_WAITS 64
+static struct lorieFrameWait {
+    Bool used;
+    int fd;
+    void (*cb)(void *param);
+    void *param;
+} lorieFrameWaits[LORIE_MAX_FRAME_WAITS];
+
+static void lorieFrameFenceReady(int fd, __unused int ready, void *data) {
+    struct lorieFrameWait *w = data;
+    void (*cb)(void *) = w->cb;
+    void *param = w->param;
+    RemoveNotifyFd(fd);
+    close(fd);
+    w->used = FALSE;
+    cb(param);
+}
+
+// The newest fence waiting in the socket, or -1. Each one came as one byte with the file attached;
+// older ones are closed (the GPU finishes its frames in order).
+static int lorieFrameTakeFence(int sock) {
+    int fence = -1;
+    for (;;) {
+        char byte;
+        struct iovec iov = { .iov_base = &byte, .iov_len = 1 };
+        char ctl[CMSG_SPACE(sizeof(int))];
+        struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = ctl, .msg_controllen = sizeof(ctl) };
+        if (recvmsg(sock, &msg, MSG_DONTWAIT | MSG_CMSG_CLOEXEC) != 1)
+            break;
+        for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
+            if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS && c->cmsg_len >= CMSG_LEN(sizeof(int))) {
+                int fd;
+                memcpy(&fd, CMSG_DATA(c), sizeof(int));
+                if (fence >= 0)
+                    close(fence);
+                fence = fd;
+            }
+        }
+    }
+    return fence;
+}
+
+static void lorieFrameWaitHere(int fence) {
+    struct pollfd p = { .fd = fence, .events = POLLIN };
+    poll(&p, 1, 100);
+    close(fence);
+}
+
+// Called by Present before it shows [pixmap]. TRUE: the GPU has not finished the frame in it;
+// cb(param) is called from the main loop when it has (param is the vblank: see lorieFrameCancel).
+Bool lorieFrameNotReady(PixmapPtr pixmap, void (*cb)(void *param), void *param) {
+    LoriePixmapPriv *priv = pixmap ? exaGetPixmapDriverPrivate(pixmap) : NULL;
+    struct lorieFrameWait *slot = NULL;
+    if (!priv || !priv->fenceSock)
+        return FALSE;
+    for (int i = 0; i < LORIE_MAX_FRAME_WAITS; i++) {
+        if (lorieFrameWaits[i].used && lorieFrameWaits[i].param == param)
+            return TRUE; // already waiting for this frame
+        if (!slot && !lorieFrameWaits[i].used)
+            slot = &lorieFrameWaits[i];
+    }
+    int fence = lorieFrameTakeFence(priv->fenceSock - 1);
+    if (fence < 0)
+        return FALSE; // no fence came with this frame: the GPU server waited for it itself
+    struct pollfd p = { .fd = fence, .events = POLLIN };
+    if (poll(&p, 1, 0) != 0) { // signaled already (or in error, which counts as passed, as for Android)
+        close(fence);
+        return FALSE;
+    }
+    if (!slot || !SetNotifyFd(fence, lorieFrameFenceReady, X_NOTIFY_READ, slot)) {
+        lorieFrameWaitHere(fence); // no room to wait in the main loop: wait here, 100 ms at most
+        return FALSE;
+    }
+    slot->used = TRUE;
+    slot->fd = fence;
+    slot->cb = cb;
+    slot->param = param;
+    return TRUE;
+}
+
+// Present is destroying the frame [param] waits for (its window or its client went).
+void lorieFrameCancel(void *param) {
+    for (int i = 0; i < LORIE_MAX_FRAME_WAITS; i++) {
+        if (lorieFrameWaits[i].used && lorieFrameWaits[i].param == param) {
+            RemoveNotifyFd(lorieFrameWaits[i].fd);
+            close(lorieFrameWaits[i].fd);
+            lorieFrameWaits[i].used = FALSE;
+        }
+    }
+}
+
 void lorieExaDestroyPixmap(__unused ScreenPtr pScreen, void *driverPriv) {
     LoriePixmapPriv *priv = driverPriv;
+    if (priv->fenceSock)
+        close(priv->fenceSock - 1);
     if (priv->buffer) {
         if (priv->locked)
             LorieBuffer_unlock(priv->buffer);
@@ -1928,6 +2036,16 @@ static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *
         check(!(priv->buffer = LorieBuffer_wrapAHardwareBuffer(buffer)), "DRI3: LorieBuffer_wrapAHardwareBuffer failed.");
 
         screen->ModifyPixmapHeader(pixmap, desc.width, desc.height, 0, 0, desc.stride * 4, NULL);
+
+        // Breadstick: keep our end of the socket (DRI3 closes the one it was given). The GPU
+        // server sends the GPU's fence for each frame it draws into this buffer down it.
+        {
+            int s = fcntl(fds[0], F_DUPFD_CLOEXEC, 3);
+            if (s >= 0) {
+                fcntl(s, F_SETFL, fcntl(s, F_GETFL) | O_NONBLOCK);
+                priv->fenceSock = s + 1;
+            }
+        }
     }
 
     return pixmap;

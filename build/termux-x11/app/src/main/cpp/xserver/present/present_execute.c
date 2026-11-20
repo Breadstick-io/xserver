@@ -37,6 +37,9 @@ present_wait_fence_triggered(void *param)
     screen_priv->re_execute(vblank);
 }
 
+/* Breadstick: lorie/InitOutput.c */
+extern Bool lorieFrameNotReady(PixmapPtr pixmap, void (*cb)(void *param), void *param);
+
 Bool
 present_execute_wait(present_vblank_ptr vblank, uint64_t crtc_msc)
 {
@@ -58,6 +61,11 @@ present_execute_wait(present_vblank_ptr vblank, uint64_t crtc_msc)
             return TRUE;
         }
     }
+    /* Breadstick (lorie/InitOutput.c): the GPU has not finished the frame in this pixmap yet. lorie
+     * watches the GPU's fence, which came on the buffer's own socket, and runs the frame when it
+     * signals, the way a wait fence would. */
+    if (vblank->pixmap && lorieFrameNotReady(vblank->pixmap, present_wait_fence_triggered, vblank))
+        return TRUE;
     return FALSE;
 }
 

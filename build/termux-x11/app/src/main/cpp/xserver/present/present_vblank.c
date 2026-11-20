@@ -197,9 +197,15 @@ present_vblank_scrap(present_vblank_ptr vblank)
     vblank->flip = FALSE;
 }
 
+/* Breadstick: lorie/InitOutput.c */
+extern void lorieFrameCancel(void *param);
+
 void
 present_vblank_destroy(present_vblank_ptr vblank)
 {
+    /* Breadstick: a frame that still waited for the GPU's fence waits no more. */
+    lorieFrameCancel(vblank);
+
     /* Remove vblank from window and screen lists */
     xorg_list_del(&vblank->window_list);
     /* Also make sure vblank is removed from event queue (wnmd) */
