@@ -571,6 +571,9 @@ void rendererRefreshContext(void) {
     if (pendingWin && (width <= 0 || height <= 0)) {
         log("Xlorie: We've got invalid surface. Probably it became invalid before we started working with it.\n");
         releaseWinAndSurface(&pendingWin, NULL);
+        // releaseWinAndSurface leaves the default window in its place, not NULL: without this the
+        // code below made a second EGL surface on the image reader's window, which defaultSfc owns.
+        pendingWin = NULL;
     }
 
     win = pendingWin;
