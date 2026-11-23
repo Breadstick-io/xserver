@@ -24,7 +24,7 @@ void lorieConfigureNotify(int width, int height, int framerate, size_t name_size
 void lorieEnableClipboardSync(Bool enable);
 void lorieSendClipboardData(const char* data);
 void lorieInitClipboard(void);
-void lorieRequestClipboard(void);
+Bool lorieRequestClipboard(void);
 void lorieHandleClipboardAnnounce(void);
 void lorieHandleClipboardData(const char* data);
 void lorieSetStylusEnabled(Bool enabled);

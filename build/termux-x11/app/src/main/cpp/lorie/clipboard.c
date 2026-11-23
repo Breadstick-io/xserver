@@ -28,6 +28,7 @@
 #include <selection.h>
 #include <propertyst.h>
 #include <xacestr.h>
+#include <dixstruct.h>
 
 #include "lorie.h"
 
@@ -371,7 +372,13 @@ static int lorieConvertSelection(ClientPtr client, Atom selection, Atom target, 
             lorieDataTargetHead = ldt;
 
             log(DEBUG, "Requesting clipboard data from client");
-            lorieRequestClipboard();
+            if (!lorieRequestClipboard()) {
+                // Nobody to ask (no app connection): nothing would ever answer this request, and it
+                // would wait in the list past its client. The caller tells the client there is no data.
+                lorieDataTargetHead = ldt->next;
+                free(ldt);
+                return BadMatch;
+            }
 
             return Success;
         } else {
@@ -558,6 +565,36 @@ void lorieHandleClipboardData(const char* data) {
     }
 }
 
+/*
+ * A request waiting for the app's clipboard text holds its client's ClientPtr until the text
+ * arrives. The text can arrive after that client has gone (a session stopped with a paste under
+ * way; the app answers the next session's first request), and lorieHandleClipboardData then handed
+ * the freed ClientRec to WriteEventsToClient: SIGSEGV in PickKeyboard at the second desktop start
+ * of an app process (Pixel soak, 2026-11-22). The X server is one per app process and outlives
+ * every session, so a waiting request leaves the list with its client.
+ */
+static void lorieClipboardClientState(__unused CallbackListPtr *callbacks, __unused void *data, void *args) {
+    NewClientInfoRec *info = args;
+    ClientPtr client = info ? info->client : NULL;
+    struct LorieDataTarget **link = &lorieDataTargetHead;
+
+    if (!client || (client->clientState != ClientStateGone && client->clientState != ClientStateRetained))
+        return;
+
+    int dropped = 0;
+    while (*link) {
+        struct LorieDataTarget *ldt = *link;
+        if (ldt->client == client) {
+            *link = ldt->next;
+            free(ldt);
+            dropped++;
+        } else
+            link = &ldt->next;
+    }
+    if (dropped)
+        log(DEBUG, "Dropped %d waiting clipboard request(s) of a client that left", dropped);
+}
+
 /* end functions related to clipboard announcing and sending */
 
 void lorieInitClipboard(void) {
@@ -576,4 +613,7 @@ void lorieInitClipboard(void) {
 
     if (!AddCallback(&SelectionCallback, lorieSelectionCallback, NULL))
         FatalError("Adding SelectionCallback failed\n");
+
+    if (!AddCallback(&ClientStateCallback, lorieClipboardClientState, NULL))
+        FatalError("Adding ClientStateCallback failed\n");
 }

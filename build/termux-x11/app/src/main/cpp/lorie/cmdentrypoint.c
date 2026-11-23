@@ -330,6 +330,12 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
         LorieBuffer* buf;
         InputThreadUnregisterDev(fd);
         close(fd);
+        // Only the connection in use takes the server's state with it. Each LorieView the app makes
+        // opens a new one, and the hangup of the one before can be seen after the new one was added
+        // (addFd runs on the main loop, this on the input thread): it used to mark the NEW
+        // connection as gone, and nothing was sent to the app after that.
+        if (conn_fd != fd)
+            return;
         conn_fd = -1;
         lorieEnableClipboardSync(FALSE);
         while ((buf = LorieBufferList_first(&registeredBuffers)))
@@ -520,11 +526,13 @@ void lorieSendClipboardData(const char* data) {
     }
 }
 
-void lorieRequestClipboard(void) {
+// Whether the app was asked: FALSE with no app connection, when no answer can come.
+Bool lorieRequestClipboard(void) {
     if (conn_fd != -1) {
         lorieEvent e = { .type = EVENT_CLIPBOARD_REQUEST };
-        write(conn_fd, &e, sizeof(e));
+        return write(conn_fd, &e, sizeof(e)) == sizeof(e);
     }
+    return FALSE;
 }
 
 // Breadstick rootless: tell the activity about a top-level window's geometry / mapped state.
@@ -575,8 +583,18 @@ bool lorieConnectionAlive(void) {
 }
 
 static Bool addFd(__unused ClientPtr pClient, void *closure) {
-    InputThreadRegisterDev((int) (int64_t) closure, handleLorieEvents, NULL);
-    conn_fd = (int) (int64_t) closure;
+    int fd = (int) (int64_t) closure;
+    if (conn_fd != -1 && conn_fd != fd) {
+        // The connection before this one has not been seen to hang up yet (handleLorieEvents will
+        // close it when it does, and leaves this one alone): what was sent to it was not sent to
+        // the new one, so the buffers are sent again and the clipboard waits for the app's word.
+        LorieBuffer* buf;
+        lorieEnableClipboardSync(FALSE);
+        while ((buf = LorieBufferList_first(&registeredBuffers)))
+            LorieBuffer_removeFromList(buf);
+    }
+    InputThreadRegisterDev(fd, handleLorieEvents, NULL);
+    conn_fd = fd;
     lorieActivityConnected();
     return TRUE;
 }

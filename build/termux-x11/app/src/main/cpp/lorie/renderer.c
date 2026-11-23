@@ -481,9 +481,12 @@ void rendererRemoveAllBuffers(void) {
 }
 
 void rendererSetWindow(JNIEnv *env, __unused jobject thiz, jobject jsfc) {
+    // ANativeWindow_fromSurface returns the window with a reference taken, and that one reference is
+    // what pendingWin, then win, own and what releaseWinAndSurface gives back. A second one was
+    // taken here and never released: every surface the app ever showed (one per desktop start) kept
+    // its buffer queue for the life of the process, with the queue's descriptors (an event poll, an
+    // event descriptor, a socket and its fences).
     ANativeWindow* newWin = jsfc ? ANativeWindow_fromSurface(env, jsfc) : NULL;
-    if (newWin)
-        ANativeWindow_acquire(newWin);
 
     pthread_mutex_lock(&stateLock);
     if (newWin && pendingWin == newWin) {

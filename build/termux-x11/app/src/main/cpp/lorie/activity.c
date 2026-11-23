@@ -182,7 +182,12 @@ static void nativeInit(JNIEnv *env, jobject thiz) {
 
     (*env)->GetJavaVM(env, &vm);
     (*vm)->AttachCurrentThread(vm, &guienv, NULL);
+    // The view in use replaces the one before: its global reference used to stay for the life of
+    // the process, and with it every LorieView (and the activity it was made in) the app ever made.
+    jobject before = globalThiz;
     globalThiz = (*guienv)->NewGlobalRef(env, thiz);
+    if (before)
+        (*guienv)->DeleteGlobalRef(guienv, before);
     connect_(NULL, NULL, -1);
 }
 
