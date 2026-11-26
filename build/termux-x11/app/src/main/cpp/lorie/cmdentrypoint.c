@@ -334,9 +334,10 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
         // opens a new one, and the hangup of the one before can be seen after the new one was added
         // (addFd runs on the main loop, this on the input thread): it used to mark the NEW
         // connection as gone, and nothing was sent to the app after that.
-        if (conn_fd != fd)
+        // Checked and cleared in one step: between a plain check and the store, addFd (main loop)
+        // could put the new connection in, and the store then marked that one as gone.
+        if (!__sync_bool_compare_and_swap(&conn_fd, fd, -1))
             return;
-        conn_fd = -1;
         lorieEnableClipboardSync(FALSE);
         while ((buf = LorieBufferList_first(&registeredBuffers)))
             LorieBuffer_removeFromList(buf);
@@ -391,8 +392,13 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
                 lorieWakeServer();
                 break;
             case EVENT_CLIPBOARD_SEND: {
+                // The payload follows its event on the connection the event came from, which is not
+                // always conn_fd: a connection being replaced stays registered until its hangup.
                 char *data = calloc(1, e.clipboardSend.count + 1);
-                read(conn_fd, data, e.clipboardSend.count);
+                if (!data)
+                    break;
+                if (read(fd, data, e.clipboardSend.count) < 0)
+                    data[0] = 0;
                 data[e.clipboardSend.count] = 0;
                 QueueWorkProc(handleClipboardData, NULL, data);
                 lorieWakeServer();

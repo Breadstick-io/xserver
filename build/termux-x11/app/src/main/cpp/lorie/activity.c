@@ -196,12 +196,16 @@ static int xcallback(int fd, int events, __unused void* data) {
     jobject thiz = globalThiz;
 
     if (events & (ALOOPER_EVENT_ERROR | ALOOPER_EVENT_HANGUP)) {
+        // A hangup already queued for a connection connect_() has since replaced: that descriptor
+        // was removed and closed there. Closing conn_fd here closed the NEW connection instead.
+        if (fd != conn_fd)
+            return 1;
         jobject instance = (*env)->CallStaticObjectMethod(env, MainActivity.self, MainActivity.getInstance);
         if (instance)
             (*env)->CallVoidMethod(env, instance, MainActivity.clientConnectedStateChanged);
 
         ALooper_removeFd(ALooper_forThread(), fd);
-        close(conn_fd);
+        close(fd);
         conn_fd = -1;
         rendererSetSharedState(NULL);
         rendererRemoveAllBuffers();
