@@ -38,6 +38,7 @@ void lorieSendWindowState(uint32_t window, int16_t x, int16_t y, uint16_t width,
                           uint16_t minW, uint16_t minH, uint16_t maxW, uint16_t maxH, uint32_t transientFor, uint8_t kind,
                           uint8_t flags, const uint16_t *frame);
 void lorieSendWindowDamage(uint32_t window);
+void lorieSendWindowBuffer(uint32_t window, uint64_t buffer, int16_t x, int16_t y, uint16_t width, uint16_t height);
 void lorieSendWindowRequest(uint32_t window, uint8_t request, int32_t a, int32_t b, int32_t c, int32_t d);
 Bool lorieWindowCommand(struct _Client *pClient, void *closure); // QueueWorkProc: runs on the X main loop
 void lorieInputOrderQueued(void);
@@ -119,6 +120,7 @@ typedef enum {
     EVENT_WINDOW_REQUEST, // Breadstick rootless: a client asked the window manager for something (move, state, ...)
     EVENT_WINDOW_COMMAND, // Breadstick rootless, app to server: move, resize, raise, focus, close, set state
     EVENT_POINTER_CONFINE, // Breadstick: a pointer grab confines the pointer (a game's ClipCursor), or no longer
+    EVENT_WINDOW_BUFFER, // Breadstick rootless: a top-level window shows another buffer now (a Present flip), same geometry
 } eventType;
 
 // EVENT_WINDOW_STATE flags: what the window says about its own frame and state.
@@ -222,6 +224,13 @@ typedef union {
         uint8_t t;
         uint32_t window;
     } windowDamage;
+    struct {
+        uint8_t t;
+        uint32_t window;
+        int16_t x, y;
+        uint16_t width, height;
+        uint64_t buffer;
+    } windowBuffer;
     struct {
         uint8_t t;
         uint8_t known;         // 1 when [window] is the keyboard focus's top-level window (0 = none)

@@ -340,6 +340,23 @@ static int xcallback(int fd, int events, __unused void* data) {
                         (*env)->CallVoidMethod(env, thiz, mc, (jboolean) (e.pointerConfine.confined != 0));
                     break;
                 }
+                case EVENT_WINDOW_BUFFER: {
+                    static jmethodID mb = NULL;
+                    AHardwareBuffer* ahb = lorieFindBuffer(e.windowBuffer.buffer);
+                    if (!mb)
+                        mb = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, thiz),
+                            "onWindowBuffer", "(ILandroid/hardware/HardwareBuffer;IIII)V");
+                    if (ahb && mb) {
+                        jobject hb = AHardwareBuffer_toHardwareBuffer(env, ahb);
+                        if (hb) {
+                            (*env)->CallVoidMethod(env, thiz, mb, (jint) e.windowBuffer.window, hb,
+                                                   (jint) e.windowBuffer.x, (jint) e.windowBuffer.y,
+                                                   (jint) e.windowBuffer.width, (jint) e.windowBuffer.height);
+                            (*env)->DeleteLocalRef(env, hb);
+                        }
+                    }
+                    break;
+                }
                 case EVENT_WINDOW_DAMAGE: {
                     // Once a frame at most per window: the method id is looked up once.
                     static jmethodID md = NULL;

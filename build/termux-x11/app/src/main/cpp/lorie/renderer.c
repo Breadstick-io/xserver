@@ -459,6 +459,9 @@ void rendererRemoveBuffer(uint64_t id) {
             // The buffer is attached to GL so we should release it from renderer thread.
             LorieBuffer_removeFromList(buf);
             LorieBuffer_addToList(buf, &removedBuffers);
+            // Breadstick: wake the renderer thread to release it now. It used to stay (the buffer's
+            // memory with it) until something else woke the thread, such as the next new buffer.
+            pthread_cond_signal(&stateCond);
         }
     }
     pthread_spin_unlock(&bufferLock);
